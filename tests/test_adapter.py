@@ -3508,3 +3508,369 @@ class TestPostChunks:
         # Continuation ids are surfaced on the SendResult and also recorded.
         assert result.continuation_message_ids
         assert set(result.continuation_message_ids) <= adapter._sent_ids
+
+
+# ---------------------------------------------------------------------------
+# 25. Standalone (out-of-process) sender — deliver=band with no live gateway
+#
+# Drives the shared primitives from section 24 with no adapter instance, so it
+# reuses that section's _rest_stub / _participant / _mention_tuples helpers.
+# ---------------------------------------------------------------------------
+
+_standalone_send = _band_mod._standalone_send
+_standalone_room = _band_mod._standalone_room
+
+
+class TestStandaloneSenderRegistration:
+    """The hook must be reachable exactly the way _send_via_adapter reaches it."""
+
+    def test_register_passes_standalone_sender_fn(self):
+        ctx = MagicMock()
+        register(ctx)
+        kwargs = ctx.register_platform.call_args[1]
+        assert kwargs["standalone_sender_fn"] is _standalone_send
+
+    def test_platform_entry_accepts_standalone_sender_fn(self):
+        """PlatformEntry really carries the field (no version guard needed)."""
+        from gateway.platform_registry import PlatformEntry
+
+        ctx = MagicMock()
+        register(ctx)
+        entry = PlatformEntry(**ctx.register_platform.call_args[1])
+        assert entry.standalone_sender_fn is _standalone_send
+        # The home-channel var the sender falls back to is the one cron reads.
+        assert entry.cron_deliver_env_var == "BAND_HOME_ROOM"
+
+
+class TestStandaloneSend:
+
+    @pytest.fixture
+    def env(self, monkeypatch):
+        """Minimal out-of-process environment: credentials only, no home room."""
+        monkeypatch.setenv("BAND_AGENT_ID", "agent-self")
+        monkeypatch.setenv("BAND_API_KEY", "secret-key")
+        for var in ("BAND_BASE_URL", "BAND_HOME_ROOM", "BAND_HUB_ROOM"):
+            monkeypatch.delenv(var, raising=False)
+        return monkeypatch
+
+    @staticmethod
+    def _patch_rest(monkeypatch, rest):
+        """Route ``_standalone_send`` at the given fake REST client."""
+        monkeypatch.setattr(_band_mod, "_standalone_rest", lambda *a, **k: rest)
+
+    # ── happy path + room resolution ──────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_posts_to_explicit_chat_id(self, env):
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "room-explicit", "cron output")
+
+        assert result == {
+            "success": True,
+            "platform": "band",
+            "chat_id": "room-explicit",
+            "message_id": "std-msg-1",
+        }
+        create = rest.agent_api_messages.create_agent_chat_message
+        create.assert_awaited_once()
+        assert create.await_args.kwargs["chat_id"] == "room-explicit"
+        assert create.await_args.kwargs["message"].content == "cron output"
+        assert _mention_tuples(create) == [[("human-1", "alice", "Alice")]]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_home_room_when_no_chat_id(self, env):
+        env.setenv("BAND_HOME_ROOM", "room-home")
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "", "hello")
+
+        assert result["success"] is True
+        assert result["chat_id"] == "room-home"
+        assert (
+            rest.agent_api_participants.list_agent_chat_participants.await_args.kwargs[
+                "chat_id"
+            ]
+            == "room-home"
+        )
+
+    def test_room_resolution_precedence(self, env):
+        """Explicit id > BAND_HOME_ROOM > BAND_HUB_ROOM > config extra."""
+        extra = {"home_channel": {"chat_id": "room-extra-home"}, "hub_room": "room-extra-hub"}
+        env.setenv("BAND_HOME_ROOM", "room-home")
+        env.setenv("BAND_HUB_ROOM", "room-hub")
+        assert _standalone_room("room-explicit", extra) == "room-explicit"
+        assert _standalone_room(None, extra) == "room-home"
+
+        env.delenv("BAND_HOME_ROOM")
+        assert _standalone_room(None, extra) == "room-hub"
+
+        env.delenv("BAND_HUB_ROOM")
+        assert _standalone_room(None, extra) == "room-extra-home"
+        assert _standalone_room(None, {"hub_room": "room-extra-hub"}) == "room-extra-hub"
+        assert _standalone_room(None, {}) is None
+        # Whitespace-only is not a room.
+        assert _standalone_room("   ", {}) is None
+
+    @pytest.mark.asyncio
+    async def test_credentials_and_host_read_from_config_extra_when_env_absent(self, env):
+        """PlatformConfig.extra is the secondary source, as in BandAdapter.__init__."""
+        env.delenv("BAND_AGENT_ID")
+        env.delenv("BAND_API_KEY")
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        seen: dict = {}
+
+        def _factory(api_key, base_url):
+            seen["api_key"] = api_key
+            seen["base_url"] = base_url
+            return rest
+
+        env.setattr(_band_mod, "_standalone_rest", _factory)
+        cfg = _make_config(
+            {"agent_id": "agent-extra", "api_key": "key-extra", "base_url": "band.internal"}
+        )
+
+        result = await _standalone_send(cfg, "room-1", "hi")
+
+        assert result["success"] is True
+        assert seen == {"api_key": "key-extra", "base_url": "band.internal"}
+
+    # ── parity with the live _send_on_link path ───────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_agent_itself_is_never_mentioned(self, env):
+        rest = _rest_stub(
+            [
+                _participant("agent-self", "Bot", "bot", ptype="Agent"),
+                _participant("human-1", "Alice", "alice"),
+            ]
+        )
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert result["success"] is True
+        assert _mention_tuples(rest.agent_api_messages.create_agent_chat_message) == [
+            [("human-1", "alice", "Alice")]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_chunks_long_message_and_repeats_mentions_on_every_chunk(self, env):
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        self._patch_rest(env, rest)
+        long_content = "x" * 9000
+        expected_chunks = BandAdapter.truncate_message(
+            long_content, BandAdapter.MAX_MESSAGE_LENGTH
+        )
+        assert len(expected_chunks) >= 2  # guard: the fixture must actually chunk
+
+        result = await _standalone_send(_make_config(), "room-1", long_content)
+
+        create = rest.agent_api_messages.create_agent_chat_message
+        assert [c.kwargs["message"].content for c in create.await_args_list] == expected_chunks
+        # Band mandates >=1 mention per message, so continuations keep them.
+        assert _mention_tuples(create) == [[("human-1", "alice", "Alice")]] * len(
+            expected_chunks
+        )
+        # message_id is the LAST chunk's id, as in _send_on_link.
+        assert result["message_id"] == f"std-msg-{len(expected_chunks)}"
+
+    @pytest.mark.asyncio
+    async def test_mentions_match_the_live_path_for_a_room_with_no_cached_sender(self, env):
+        """Both paths take _mention_items' all-non-agent-participants branch.
+
+        The standalone path cannot reach ``_build_mentions``' preferred
+        last-human-sender (that cache lives on a connected adapter), so parity is
+        against the live path's behaviour for a room it has not heard from.
+        """
+        participants = [
+            _participant("agent-self", "Bot", "bot", ptype="Agent"),
+            _participant("human-1", "Alice", "alice"),
+            _participant("human-2", "Bob", "bob"),
+        ]
+
+        standalone_rest = _rest_stub(participants)
+        self._patch_rest(env, standalone_rest)
+        await _standalone_send(_make_config(), "room-parity", "same text")
+
+        adapter = _make_adapter(env, agent_id="agent-self")
+        adapter._agent_id = "agent-self"
+        live_link = MagicMock()
+        live_link.rest = _rest_stub(participants)
+        adapter._link = live_link
+        assert not adapter._last_human_sender  # cold room, no cached sender
+        live_result = await adapter._send_on_link("room-parity", "same text")
+
+        assert live_result.success is True
+        assert _mention_tuples(standalone_rest.agent_api_messages.create_agent_chat_message) \
+            == _mention_tuples(live_link.rest.agent_api_messages.create_agent_chat_message)
+
+    # ── actionable failures ───────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_missing_api_key_names_the_variable(self, env):
+        env.delenv("BAND_API_KEY")
+        rest = _rest_stub([_participant("human-1")])
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "BAND_API_KEY" in result["error"]
+        assert "BAND_AGENT_ID" not in result["error"]
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_agent_id_names_the_variable(self, env):
+        env.delenv("BAND_AGENT_ID")
+        rest = _rest_stub([_participant("human-1")])
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "BAND_AGENT_ID" in result["error"]
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_both_credentials_names_both(self, env):
+        env.delenv("BAND_AGENT_ID")
+        env.delenv("BAND_API_KEY")
+        self._patch_rest(env, _rest_stub([_participant("human-1")]))
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "BAND_AGENT_ID" in result["error"]
+        assert "BAND_API_KEY" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_no_target_room_points_at_band_home_room(self, env):
+        rest = _rest_stub([_participant("human-1")])
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "", "hi")
+
+        assert "BAND_HOME_ROOM" in result["error"]
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_mentionable_recipient_fails_without_posting(self, env):
+        # Agent-only room: nothing to mention once self is excluded.
+        rest = _rest_stub([_participant("agent-self", "Bot", "bot", ptype="Agent")])
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "mention" in result["error"].lower()
+        assert "success" not in result
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_participant_fetch_failure_reports_the_real_cause(self, env):
+        rest = _rest_stub()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            side_effect=RuntimeError("participants 503")
+        )
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "participants 503" in result["error"]
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_post_failure_returns_error_dict_instead_of_raising(self, env):
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            side_effect=RuntimeError("network failure")
+        )
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "network failure" in result["error"]
+        assert "success" not in result
+
+    @pytest.mark.asyncio
+    async def test_client_build_failure_is_reported(self, env):
+        def _boom(api_key, base_url):
+            raise RuntimeError("no client")
+
+        env.setattr(_band_mod, "_standalone_rest", _boom)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "no client" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_missing_sdk_returns_the_install_command(self, env):
+        env.setattr(_band_mod, "check_band_requirements", lambda: False)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "band-sdk" in result["error"]
+        assert _band_mod._band_libs.sdk_install_command() in result["error"]
+
+    # ── contract shape ────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_accepts_the_full_sender_signature(self, env):
+        """thread_id / media_files / force_document are parity-only, never fatal."""
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(
+            _make_config(),
+            "room-1",
+            "hi",
+            thread_id="ignored",
+            media_files=["/tmp/nope.png"],
+            force_document=True,
+        )
+
+        assert result["success"] is True
+        # Band has rooms, not threads — nothing thread-shaped reaches the API.
+        assert set(rest.agent_api_messages.create_agent_chat_message.await_args.kwargs) == {
+            "chat_id",
+            "message",
+            "request_options",
+        }
+
+
+class TestStandaloneRestClient:
+    """``_standalone_rest`` builds the SDK client from credentials alone."""
+
+    def test_builds_async_rest_client_with_derived_url(self, monkeypatch):
+        built: dict = {}
+
+        class _FakeAsyncRestClient:
+            def __init__(self, api_key, base_url):
+                built["api_key"] = api_key
+                built["base_url"] = base_url
+
+        monkeypatch.setattr(
+            sys.modules["band.client.rest"], "AsyncRestClient", _FakeAsyncRestClient
+        )
+
+        client = _band_mod._standalone_rest("secret-key", "band.internal:8443")
+
+        assert isinstance(client, _FakeAsyncRestClient)
+        assert built == {
+            "api_key": "secret-key",
+            "base_url": "https://band.internal:8443",
+        }
+
+    def test_default_host_when_no_base_url(self, monkeypatch):
+        built: dict = {}
+
+        class _FakeAsyncRestClient:
+            def __init__(self, api_key, base_url):
+                built["base_url"] = base_url
+
+        monkeypatch.setattr(
+            sys.modules["band.client.rest"], "AsyncRestClient", _FakeAsyncRestClient
+        )
+
+        _band_mod._standalone_rest("secret-key", "")
+
+        assert built["base_url"] == "https://app.band.ai"

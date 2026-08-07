@@ -323,6 +323,13 @@ has no DMs, so an un-mentioned message is ignored by design. A reply means you'r
   backstop in addition to the SDK's own filtering.
 - **Outbound**: posts via the REST client, chunking long messages. Each reply @mentions the
   room's last human sender (falling back to all non-agent participants).
+- **Outbound without a gateway**: the plugin also registers a `standalone_sender_fn`, so a
+  `deliver: band` cron job delivers even when it fires in a process that holds no gateway runner —
+  a forced `hermes cron run <id>` is the everyday case. That path has no link and no caches, so it
+  resolves everything from the environment (`BAND_AGENT_ID`, `BAND_API_KEY`, `BAND_BASE_URL`, and
+  the target room from `BAND_HOME_ROOM` → `BAND_HUB_ROOM`) and mentions all non-agent participants
+  — the same branch the live path takes for a room it has not yet heard a human speak in. Chunking
+  and the mandatory per-chunk @mention are shared code with the live send, so the two cannot drift.
 
 ### The Hub (main channel + command surface)
 
@@ -487,9 +494,11 @@ whatever the agent didn't mark `processed` is still owed to it, across any outag
 
 ### Limitations
 
-- **Memory + standalone cron deferred.** Memory preload/write-through and out-of-process cron
-  delivery (`standalone_sender_fn`) land in later passes (extension points are marked
-  `# TODO (<pass>):` in the adapter).
+- **Memory deferred.** Memory preload/write-through lands in a later pass (the extension point is
+  marked `# TODO (<pass>):` in the adapter).
+- **Out-of-process delivery is text-only.** The `standalone_sender_fn` accepts `media_files` /
+  `force_document` for signature parity but ignores them, and it cannot prefer a room's last human
+  sender (that cache lives on a connected adapter) — it mentions all non-agent participants.
 - **No per-message retry cap on failure.** A turn that errors is marked `failed`, which the server
   may re-offer on a later `/next` drain. There is no attempt-count ceiling yet, so a
   persistently-failing message can re-deliver across reconnects.

@@ -14,15 +14,19 @@ Configuration is env-driven (seeded into ``PlatformConfig.extra`` by
     BAND_BASE_URL    Band host base URL (default app.band.ai)
     ... see plugin.yaml for the full optional set.
 
-Memory preload/write-through and cron standalone delivery are deferred to
-later passes; their extension points are marked with ``# TODO (<pass>):``
-below so they drop in cleanly.
+Memory preload/write-through is deferred to a later pass; its extension point
+is marked with ``# TODO (<pass>):`` below so it drops in cleanly.
 
 Scope notes:
   * Band rooms are not threads — ``thread_id`` is always None.
   * Sends require at least one @mention (API enforces ≥1); mentions are built
     from the cached last-human-sender, falling back to all non-agent room
     participants.
+  * Outbound sends have two entry points over one primitive: the live adapter's
+    ``send``/``_send_on_link`` (link-bound) and the module-level
+    ``_standalone_send`` (env-only, for a process with no gateway runner —
+    see its section below). Both resolve mentions with ``_mention_items`` and
+    write through ``_post_chunks``, so they cannot drift.
   * The HUB: on connect the adapter ensures a private owner↔agent control
     room — the pinned ``BAND_HUB_ROOM`` if set, else a freshly created
     "Hermes Hub" — and wires it as the platform home channel (the Band main
@@ -268,11 +272,10 @@ def _mention_items(
 async def _fetch_participants(rest: Any, room_id: str) -> List[Dict[str, Any]]:
     """Fetch a room's participants as ``{id, name, handle, type}`` dicts.
 
-    The exact shape ``_mention_items`` consumes. Lifted out of
-    ``BandAdapter._get_participants`` and off the adapter instance: it needs only
-    a REST client, so any caller holding one resolves mentions from identical
-    data. Errors propagate — each caller decides whether a failed fetch is fatal
-    (``_get_participants`` warns and caches an empty list).
+    The exact shape ``_mention_items`` consumes. Shared by the live adapter's
+    cached ``_get_participants`` and the out-of-process ``_standalone_send`` so
+    both resolve mentions from identical data. Errors propagate — each caller
+    decides whether a failed fetch is fatal.
     """
     resp = await rest.agent_api_participants.list_agent_chat_participants(
         chat_id=room_id,
@@ -300,10 +303,9 @@ async def _post_chunks(
 ) -> tuple:
     """Post ``content`` into ``room_id`` as mention-carrying chunks.
 
-    The single outbound-write primitive. Lifted out of
-    ``BandAdapter._send_on_link`` and off the adapter instance — it needs only a
-    REST client — so chunking and the mandatory mention handling are defined in
-    exactly one place and a second send path cannot drift from the live one.
+    The single outbound-write primitive, shared by the live adapter's
+    ``_send_on_link`` and the out-of-process ``_standalone_send`` — the two send
+    paths would otherwise drift silently on chunking or mention handling.
 
     Mentions are repeated on EVERY chunk: the Band API mandates ≥1 mention per
     message, so continuation chunks cannot drop them. Multi-chunk replies
@@ -311,9 +313,9 @@ async def _post_chunks(
     confirm whether the API permits mention-less continuation messages before
     changing this. (smoke-test item)
 
-    ``on_sent`` is invoked with each id Band returns (``_send_on_link`` passes
+    ``on_sent`` is invoked with each id Band returns (the live adapter passes
     ``_record_sent_id`` so its own posts are recognised when the platform echoes
-    them back; a caller with no inbound consumer passes nothing).
+    them back; the standalone path has no inbound consumer and passes nothing).
 
     Returns ``(last_id, continuation_ids, last_response)``. Exceptions propagate:
     each caller owns its own failure-result shape.
@@ -2206,7 +2208,8 @@ class BandAdapter(BasePlatformAdapter):
                 retryable=False,
             )
 
-        # Chunking + the mandatory per-chunk mention list live in _post_chunks.
+        # Chunking + the mandatory per-chunk mention list live in _post_chunks,
+        # shared with the out-of-process _standalone_send.
         try:
             last_id, continuation, last_resp = await _post_chunks(
                 self._link.rest,
@@ -2370,6 +2373,212 @@ class BandAdapter(BasePlatformAdapter):
         # Participant fetch failed. Band has no DMs, so "group" is the correct
         # fall-through type (never the base contract's "unknown").
         return {"name": chat_id, "type": "group"}
+
+
+# ---------------------------------------------------------------------------
+# Standalone (out-of-process) sending
+#
+# A ``deliver: band`` cron job can fire in a process that holds no gateway
+# runner — a forced ``hermes cron run <id>`` is the everyday case, and it is
+# also the only way to exercise ``deliver: band`` by hand. There is no adapter
+# instance there, so no link, no participant cache and no resolved identity;
+# ``tools/send_message_tool._send_via_adapter`` therefore falls back to the
+# platform entry's ``standalone_sender_fn``, and without one it returns
+# "No live adapter for platform 'band'".
+#
+# SCOPE: scheduled deliveries were never affected. ``cron.scheduler``'s tick and
+# ``cron.scheduler_provider`` both hand ``run_one_job`` the gateway's live
+# adapters, and even the in-gateway ``cronjob`` tool (which passes none) is
+# rescued by ``_send_via_adapter``'s ``_gateway_runner_ref()`` lookup. What this
+# fixes is delivery from a process where that lookup comes back empty.
+#
+# Everything below resolves from env — with ``PlatformConfig.extra`` as the
+# secondary source, exactly as ``BandAdapter.__init__`` does — and writes
+# through the same ``_mention_items`` / ``_post_chunks`` primitives the live
+# path uses.
+# ---------------------------------------------------------------------------
+
+# Every failure this path returns is prefixed so a cron job's error text names
+# the code that produced it.
+_STANDALONE_PREFIX = "Band standalone send"
+
+
+def _standalone_room(chat_id: Optional[str], extra: Dict[str, Any]) -> Optional[str]:
+    """Resolve the target room for an out-of-process send.
+
+    An explicit ``chat_id`` — what cron passes once it has resolved the job's
+    delivery target — always wins. Otherwise fall back to the home channel the
+    same way every other reader does, and in the same order, so this path can
+    never disagree with the rest of the plugin about where "home" is:
+
+      1. ``BAND_HOME_ROOM`` — the ``cron_deliver_env_var`` this platform
+         registers, and what ``_wire_home_channel`` persists.
+      2. ``BAND_HUB_ROOM`` — the hub is the default home when no override was
+         written yet.
+      3. the ``PlatformConfig.extra`` mirrors ``_env_enablement`` seeds from
+         those same two vars (a config.yaml-configured install).
+    """
+    room = str(chat_id or "").strip()
+    if room:
+        return room
+    home_channel = extra.get("home_channel")
+    for candidate in (
+        os.getenv("BAND_HOME_ROOM"),
+        os.getenv("BAND_HUB_ROOM"),
+        home_channel.get("chat_id") if isinstance(home_channel, dict) else None,
+        extra.get("hub_room"),
+    ):
+        room = str(candidate or "").strip()
+        if room:
+            return room
+    return None
+
+
+def _standalone_rest(api_key: str, base_url: str) -> Any:
+    """Build a REST client from credentials alone — no link, no gateway.
+
+    Mirrors ``BandLink``'s own construction (``AsyncRestClient(api_key=...,
+    base_url=rest_url)``) and the env-credential fallback ``tools._rest`` already
+    uses for out-of-process tool calls, deriving the REST URL through the shared
+    ``_derive_urls`` so a self-hosted ``BAND_BASE_URL`` resolves identically.
+
+    Imported inside the function, not at module top: this module must import with
+    no Band SDK (and no Hermes host) present.
+    """
+    from band.client.rest import AsyncRestClient
+
+    _, rest_url = _derive_urls(base_url)
+    return AsyncRestClient(api_key=api_key, base_url=rest_url)
+
+
+async def _standalone_send(
+    pconfig,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[List[str]] = None,
+    force_document: bool = False,
+) -> Dict[str, Any]:
+    """Post a Band message with no adapter instance and no live gateway.
+
+    Implements the ``standalone_sender_fn`` contract (see
+    ``gateway.platform_registry.PlatformEntry``) so a ``deliver: band`` job still
+    delivers from a process with no gateway runner. Returns ``{"success": True,
+    "message_id": ...}`` or ``{"error": str}`` — never raises for an expected
+    failure, because the error text is what the operator sees in the job result.
+
+    Send behaviour matches ``_send_on_link``: mentions come from the room's
+    participants via the shared ``_mention_items``, and chunking runs through
+    ``_post_chunks`` at ``BandAdapter.MAX_MESSAGE_LENGTH`` with the mandatory
+    mention list repeated on every chunk. The one thing this path cannot
+    reproduce is ``_build_mentions``'s *preferred* last-human-sender — that cache
+    only exists on a connected adapter — so it always takes the
+    all-non-agent-participants branch, which is exactly what the live path does
+    for a room it has not yet heard a human speak in.
+
+    ``thread_id`` is ignored: Band has rooms, not threads (the live ``send``
+    ignores it too). ``media_files`` / ``force_document`` are accepted for
+    signature parity only — Band delivery here is text-only, and the caller
+    already strips attachments and warns for platforms without media support.
+    """
+    extra = getattr(pconfig, "extra", {}) or {}
+
+    if not check_band_requirements():
+        # Same remediation as the adapter's preflight — the read-only-venv-safe
+        # --target form, since a bare install dies on hosted runtimes.
+        return {
+            "error": (
+                f"{_STANDALONE_PREFIX}: band-sdk not installed. Directory plugin "
+                f"installs do not install Python dependencies; fix with: "
+                f"{_band_libs.sdk_install_command()}"
+            )
+        }
+
+    agent_id = (os.getenv("BAND_AGENT_ID") or extra.get("agent_id", "")).strip()
+    api_key = (os.getenv("BAND_API_KEY") or extra.get("api_key", "")).strip()
+    # The agent id is not optional here even though only mentions use it: without
+    # it _mention_items cannot exclude the agent itself, and an agent that
+    # @mentions itself pings itself into a loop.
+    missing = [
+        name
+        for name, value in (("BAND_AGENT_ID", agent_id), ("BAND_API_KEY", api_key))
+        if not value
+    ]
+    if missing:
+        return {
+            "error": (
+                f"{_STANDALONE_PREFIX}: {' and '.join(missing)} must be set — "
+                f"out-of-process delivery reads credentials from the environment "
+                f"only (there is no connected adapter to borrow them from)"
+            )
+        }
+
+    room_id = _standalone_room(chat_id, extra)
+    if not room_id:
+        return {
+            "error": (
+                f"{_STANDALONE_PREFIX}: no target room — pass a room id or set "
+                f"BAND_HOME_ROOM (this platform's cron delivery target). It is "
+                f"written automatically the first time the gateway connects and "
+                f"creates the hub."
+            )
+        }
+
+    base_url = (os.getenv("BAND_BASE_URL") or extra.get("base_url", "")).strip()
+    try:
+        rest = _standalone_rest(api_key, base_url)
+    except Exception as e:
+        return {"error": f"{_STANDALONE_PREFIX}: could not build a REST client: {e}"}
+
+    try:
+        participants = await _fetch_participants(rest, room_id)
+    except Exception as e:
+        # The live path swallows this inside _get_participants and then fails on
+        # the empty mention list. Report the real cause instead: a cron job that
+        # cannot deliver should say why, not blame the mention list.
+        logger.error(
+            "[band] Standalone send could not fetch participants for room %s: %s",
+            _short_id(room_id),
+            e,
+        )
+        return {
+            "error": (
+                f"{_STANDALONE_PREFIX}: could not fetch participants for room "
+                f"{room_id}, needed for the mandatory @mention: {e}"
+            )
+        }
+
+    mention_items = _mention_items(participants, agent_id=agent_id)
+    if not mention_items:
+        return {
+            "error": (
+                f"{_STANDALONE_PREFIX}: no mentionable recipient in room "
+                f"{room_id} (Band requires >=1 mention per message)"
+            )
+        }
+
+    try:
+        last_id, _continuation, _last_resp = await _post_chunks(
+            rest,
+            room_id,
+            message,
+            mention_items,
+            BandAdapter.MAX_MESSAGE_LENGTH,
+        )
+    except Exception as e:
+        logger.error(
+            "[band] Standalone send failed for room %s: %s", _short_id(room_id), e
+        )
+        return {"error": f"{_STANDALONE_PREFIX}: {e}"}
+
+    logger.info("[band] Standalone send delivered to room %s", _short_id(room_id))
+    return {
+        "success": True,
+        "platform": "band",
+        "chat_id": room_id,
+        "message_id": last_id,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2640,8 +2849,10 @@ def register(ctx) -> None:
         # and lets /sethome (run from a Band room) persist the main channel.
         # The adapter auto-points this at the hub unless explicitly overridden.
         cron_deliver_env_var="BAND_HOME_ROOM",
-        # TODO (cron pass): add a standalone_sender_fn for out-of-process
-        #   deliver=band cron jobs (gateway runner ref is None there).
+        # Out-of-process delivery. Without this hook a ``deliver: band`` job
+        # fired from a process with no gateway runner (a forced ``hermes cron
+        # run <id>``) fails with "No live adapter for platform 'band'".
+        standalone_sender_fn=_standalone_send,
     )
 
     # Register the Band action toolset (Tier-A platform tools + Tier-B
