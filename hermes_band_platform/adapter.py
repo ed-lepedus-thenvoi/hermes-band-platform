@@ -265,6 +265,79 @@ def _mention_items(
     return items
 
 
+async def _fetch_participants(rest: Any, room_id: str) -> List[Dict[str, Any]]:
+    """Fetch a room's participants as ``{id, name, handle, type}`` dicts.
+
+    The exact shape ``_mention_items`` consumes. Lifted out of
+    ``BandAdapter._get_participants`` and off the adapter instance: it needs only
+    a REST client, so any caller holding one resolves mentions from identical
+    data. Errors propagate — each caller decides whether a failed fetch is fatal
+    (``_get_participants`` warns and caches an empty list).
+    """
+    resp = await rest.agent_api_participants.list_agent_chat_participants(
+        chat_id=room_id,
+        request_options=DEFAULT_REQUEST_OPTIONS,
+    )
+    return [
+        {
+            "id": getattr(p, "id", None),
+            "name": getattr(p, "name", None),
+            "handle": getattr(p, "handle", None),
+            "type": getattr(p, "type", None),
+        }
+        for p in (getattr(resp, "data", None) or [])
+    ]
+
+
+async def _post_chunks(
+    rest: Any,
+    room_id: str,
+    content: str,
+    mention_items: List[Any],
+    max_length: int,
+    *,
+    on_sent: Optional[Callable[[str], None]] = None,
+) -> tuple:
+    """Post ``content`` into ``room_id`` as mention-carrying chunks.
+
+    The single outbound-write primitive. Lifted out of
+    ``BandAdapter._send_on_link`` and off the adapter instance — it needs only a
+    REST client — so chunking and the mandatory mention handling are defined in
+    exactly one place and a second send path cannot drift from the live one.
+
+    Mentions are repeated on EVERY chunk: the Band API mandates ≥1 mention per
+    message, so continuation chunks cannot drop them. Multi-chunk replies
+    (> ``max_length``) are rare; if duplicate notifications become a problem,
+    confirm whether the API permits mention-less continuation messages before
+    changing this. (smoke-test item)
+
+    ``on_sent`` is invoked with each id Band returns (``_send_on_link`` passes
+    ``_record_sent_id`` so its own posts are recognised when the platform echoes
+    them back; a caller with no inbound consumer passes nothing).
+
+    Returns ``(last_id, continuation_ids, last_response)``. Exceptions propagate:
+    each caller owns its own failure-result shape.
+    """
+    last_id: Optional[str] = None
+    last_resp: Any = None
+    continuation: List[str] = []
+    for chunk in BasePlatformAdapter.truncate_message(content, max_length):
+        resp = await rest.agent_api_messages.create_agent_chat_message(
+            chat_id=room_id,
+            message=ChatMessageRequest(content=chunk, mentions=mention_items),
+            request_options=DEFAULT_REQUEST_OPTIONS,
+        )
+        last_resp = resp
+        sent_id = getattr(getattr(resp, "data", None), "id", None)
+        if sent_id:
+            if last_id is not None:
+                continuation.append(last_id)
+            last_id = sent_id
+            if on_sent is not None:
+                on_sent(sent_id)
+    return last_id, continuation, last_resp
+
+
 class _TranscriptRow(TypedDict):
     """The stable, documented subset of a Hermes session-transcript row.
 
@@ -2053,20 +2126,7 @@ class BandAdapter(BasePlatformAdapter):
 
         participants: List[Dict[str, Any]] = []
         try:
-            resp = await self._link.rest.agent_api_participants.list_agent_chat_participants(
-                chat_id=room_id,
-                request_options=DEFAULT_REQUEST_OPTIONS,
-            )
-            data = getattr(resp, "data", None) or []
-            participants = [
-                {
-                    "id": getattr(p, "id", None),
-                    "name": getattr(p, "name", None),
-                    "handle": getattr(p, "handle", None),
-                    "type": getattr(p, "type", None),
-                }
-                for p in data
-            ]
+            participants = await _fetch_participants(self._link.rest, room_id)
         except Exception as e:
             logger.warning(
                 "[band] Failed to fetch participants for room %s: %s",
@@ -2146,30 +2206,16 @@ class BandAdapter(BasePlatformAdapter):
                 retryable=False,
             )
 
-        chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH)
-
-        last_id: Optional[str] = None
-        last_resp: Any = None
-        continuation: List[str] = []
-        # Mentions are repeated on every chunk: the Band API mandates >=1 mention
-        # per message, so continuation chunks cannot drop them. Multi-chunk
-        # replies (> MAX_MESSAGE_LENGTH) are rare; if duplicate notifications
-        # become a problem, confirm whether the API permits mention-less
-        # continuation messages before changing this. (smoke-test item)
+        # Chunking + the mandatory per-chunk mention list live in _post_chunks.
         try:
-            for chunk in chunks:
-                resp = await self._link.rest.agent_api_messages.create_agent_chat_message(
-                    chat_id=room_id,
-                    message=ChatMessageRequest(content=chunk, mentions=mention_items),
-                    request_options=DEFAULT_REQUEST_OPTIONS,
-                )
-                last_resp = resp
-                sent_id = getattr(getattr(resp, "data", None), "id", None)
-                if sent_id:
-                    if last_id is not None:
-                        continuation.append(last_id)
-                    last_id = sent_id
-                    self._record_sent_id(sent_id)
+            last_id, continuation, last_resp = await _post_chunks(
+                self._link.rest,
+                room_id,
+                content,
+                mention_items,
+                self.MAX_MESSAGE_LENGTH,
+                on_sent=self._record_sent_id,
+            )
         except Exception as e:
             logger.error("[band] Failed to send to room %s: %s", _short_id(room_id), e)
             await self._record_hub_send(room_id, ok=False)

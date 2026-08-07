@@ -3277,3 +3277,234 @@ class TestHubFailover:
         await adapter._record_hub_send("old-hub", ok=False)
 
         link.rest.agent_api_chats.create_agent_chat.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 24. Shared send primitives — _fetch_participants / _post_chunks
+# ---------------------------------------------------------------------------
+
+_fetch_participants = _band_mod._fetch_participants
+_post_chunks = _band_mod._post_chunks
+
+
+def _rest_stub(participants=()):
+    """Fake REST client exposing only what the shared send primitives drive.
+
+    Mirrors the fake links used elsewhere in this file: the participant listing
+    and the message create, both AsyncMocks so individual tests can override
+    ``side_effect``. Posted messages get sequential ``std-msg-<n>`` ids so a
+    chunked send is traceable back to its last chunk.
+    """
+    rest = MagicMock()
+    rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+        return_value=SimpleNamespace(data=list(participants))
+    )
+    posted = 0
+
+    async def _create(*args, **kwargs):
+        nonlocal posted
+        posted += 1
+        return SimpleNamespace(data=SimpleNamespace(id=f"std-msg-{posted}"))
+
+    rest.agent_api_messages.create_agent_chat_message = AsyncMock(side_effect=_create)
+    return rest
+
+
+def _participant(pid, name=None, handle=None, ptype="User"):
+    return SimpleNamespace(id=pid, name=name, handle=handle, type=ptype)
+
+
+def _mention_tuples(create_mock):
+    """``[(id, handle, name), ...]`` per posted chunk, in call order."""
+    return [
+        [
+            (getattr(m, "id", None), getattr(m, "handle", None), getattr(m, "name", None))
+            for m in call.kwargs["message"].mentions
+        ]
+        for call in create_mock.await_args_list
+    ]
+
+
+class TestFetchParticipants:
+
+    @pytest.mark.asyncio
+    async def test_normalizes_sdk_objects_to_mention_item_shape(self):
+        rest = _rest_stub(
+            [
+                _participant("agent-1", "Bot", "bot", ptype="Agent"),
+                _participant("human-1", "Alice", "alice"),
+            ]
+        )
+
+        participants = await _fetch_participants(rest, "room-1")
+
+        assert participants == [
+            {"id": "agent-1", "name": "Bot", "handle": "bot", "type": "Agent"},
+            {"id": "human-1", "name": "Alice", "handle": "alice", "type": "User"},
+        ]
+        # The room is passed as chat_id, with the retry-enabled request options.
+        kwargs = rest.agent_api_participants.list_agent_chat_participants.await_args.kwargs
+        assert kwargs["chat_id"] == "room-1"
+        assert kwargs["request_options"] is _band_mod.DEFAULT_REQUEST_OPTIONS
+
+    @pytest.mark.asyncio
+    async def test_missing_attributes_become_none(self):
+        rest = _rest_stub([SimpleNamespace(id="bare-1")])
+
+        assert await _fetch_participants(rest, "room-1") == [
+            {"id": "bare-1", "name": None, "handle": None, "type": None}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_absent_or_empty_data_yields_empty_list(self):
+        for payload in (SimpleNamespace(data=None), SimpleNamespace(data=[]), SimpleNamespace()):
+            rest = MagicMock()
+            rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+                return_value=payload
+            )
+            assert await _fetch_participants(rest, "room-1") == []
+
+    @pytest.mark.asyncio
+    async def test_errors_propagate_to_the_caller(self):
+        rest = MagicMock()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            side_effect=RuntimeError("participants 503")
+        )
+
+        with pytest.raises(RuntimeError, match="participants 503"):
+            await _fetch_participants(rest, "room-1")
+
+    @pytest.mark.asyncio
+    async def test_adapter_cache_swallows_the_error_and_caches_empty(self, monkeypatch):
+        """_get_participants still owns the swallow-and-warn policy."""
+        adapter = _make_adapter(monkeypatch)
+        link = MagicMock()
+        link.rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        adapter._link = link
+
+        assert await adapter._get_participants("room-1") == []
+        assert adapter._participants_cache["room-1"] == []
+
+
+class TestPostChunks:
+
+    @staticmethod
+    def _mentions(*ids):
+        return [
+            _band_mod.ChatMessageRequestMentionsItem(id=i, handle=None, name=None)
+            for i in ids
+        ]
+
+    @pytest.mark.asyncio
+    async def test_short_content_posts_once_with_no_continuation(self):
+        rest = _rest_stub()
+        mentions = self._mentions("human-1")
+
+        last_id, continuation, last_resp = await _post_chunks(
+            rest, "room-1", "hello", mentions, 4000
+        )
+
+        assert (last_id, continuation) == ("std-msg-1", [])
+        assert last_resp.data.id == "std-msg-1"
+        create = rest.agent_api_messages.create_agent_chat_message
+        create.assert_awaited_once()
+        assert create.await_args.kwargs["chat_id"] == "room-1"
+        assert create.await_args.kwargs["message"].content == "hello"
+        assert create.await_args.kwargs["message"].mentions is mentions
+
+    @pytest.mark.asyncio
+    async def test_long_content_is_split_exactly_as_truncate_message(self):
+        rest = _rest_stub()
+        content = "x" * 9000
+        expected = BandAdapter.truncate_message(content, 4000)
+        assert len(expected) >= 2  # guard: the fixture must actually chunk
+
+        last_id, continuation, _ = await _post_chunks(
+            rest, "room-1", content, self._mentions("human-1"), 4000
+        )
+
+        create = rest.agent_api_messages.create_agent_chat_message
+        assert [c.kwargs["message"].content for c in create.await_args_list] == expected
+        # Last id is returned; every earlier id is a continuation.
+        assert last_id == f"std-msg-{len(expected)}"
+        assert continuation == [f"std-msg-{n}" for n in range(1, len(expected))]
+
+    @pytest.mark.asyncio
+    async def test_mentions_are_repeated_on_every_chunk(self):
+        rest = _rest_stub()
+        content = "y" * 9000
+        expected = BandAdapter.truncate_message(content, 4000)
+
+        await _post_chunks(
+            rest, "room-1", content, self._mentions("human-1", "human-2"), 4000
+        )
+
+        # Band mandates >=1 mention per message, so continuations keep them.
+        create = rest.agent_api_messages.create_agent_chat_message
+        assert _mention_tuples(create) == [
+            [("human-1", None, None), ("human-2", None, None)]
+        ] * len(expected)
+
+    @pytest.mark.asyncio
+    async def test_on_sent_receives_every_returned_id(self):
+        rest = _rest_stub()
+        seen: list = []
+        content = "z" * 9000
+        expected = BandAdapter.truncate_message(content, 4000)
+
+        await _post_chunks(
+            rest,
+            "room-1",
+            content,
+            self._mentions("human-1"),
+            4000,
+            on_sent=seen.append,
+        )
+
+        assert seen == [f"std-msg-{n}" for n in range(1, len(expected) + 1)]
+
+    @pytest.mark.asyncio
+    async def test_id_less_responses_do_not_advance_the_cursor(self):
+        rest = _rest_stub()
+        rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=None)
+        )
+        seen: list = []
+
+        last_id, continuation, last_resp = await _post_chunks(
+            rest, "room-1", "hello", self._mentions("human-1"), 4000, on_sent=seen.append
+        )
+
+        assert (last_id, continuation, seen) == (None, [], [])
+        assert last_resp is not None  # the response is still handed back
+
+    @pytest.mark.asyncio
+    async def test_errors_propagate_so_the_caller_owns_the_failure_shape(self):
+        rest = _rest_stub()
+        rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            side_effect=RuntimeError("network failure")
+        )
+
+        with pytest.raises(RuntimeError, match="network failure"):
+            await _post_chunks(rest, "room-1", "hello", self._mentions("human-1"), 4000)
+
+    @pytest.mark.asyncio
+    async def test_send_on_link_still_records_its_own_sent_ids(self, monkeypatch):
+        """The live path's echo backstop rides on the on_sent hook."""
+        adapter = _make_adapter(monkeypatch)
+        link = MagicMock()
+        link.rest = _rest_stub()
+        adapter._link = link
+        adapter._last_human_sender["room-1"] = {
+            "id": "human-1", "handle": "alice", "name": "Alice",
+        }
+
+        result = await adapter._send_on_link("room-1", "x" * 9000)
+
+        assert result.success is True
+        assert result.message_id in adapter._sent_ids
+        # Continuation ids are surfaced on the SendResult and also recorded.
+        assert result.continuation_message_ids
+        assert set(result.continuation_message_ids) <= adapter._sent_ids
