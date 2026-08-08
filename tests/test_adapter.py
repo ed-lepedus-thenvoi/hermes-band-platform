@@ -3874,3 +3874,217 @@ class TestStandaloneRestClient:
         _band_mod._standalone_rest("secret-key", "")
 
         assert built["base_url"] == "https://app.band.ai"
+
+
+# A distinctive body used to prove message content never reaches a log.
+SECRET_BODY = "correct-horse-battery-staple-9d2f"
+
+# Logger the adapter emits under; asserted against via caplog.
+_ADAPTER_LOGGER = "hermes_band_platform.adapter"
+
+
+class TestSendLogging:
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        link = MagicMock()
+        link.rest = _rest_stub()
+        adapter._link = link
+        adapter._last_human_sender["room-1"] = {
+            "id": "human-1", "handle": "alice", "name": "Alice",
+        }
+        return adapter
+
+    @staticmethod
+    def _posted_line(caplog):
+        lines = [r for r in caplog.records if "Posted" in r.getMessage()]
+        assert len(lines) == 1, f"expected one post line, got {len(lines)}"
+        return lines[0]
+
+    @pytest.mark.asyncio
+    async def test_successful_send_reports_room_size_and_message_id(
+        self, adapter, caplog
+    ):
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await adapter._send_on_link("room-1", "hello there")
+
+        assert result.success is True
+        record = self._posted_line(caplog)
+        # Routine success is debug — this runs on every turn.
+        assert record.levelno == logging.DEBUG
+        message = record.getMessage()
+        assert "1 chunk(s)" in message
+        assert "11 chars" in message
+        assert _short_id("room-1") in message
+        assert _short_id("std-msg-1") in message
+
+    @pytest.mark.asyncio
+    async def test_chunked_send_reports_how_many_chunks_went_out(
+        self, adapter, caplog
+    ):
+        content = "x" * 9000
+        expected = BandAdapter.truncate_message(content, BandAdapter.MAX_MESSAGE_LENGTH)
+        assert len(expected) >= 2  # guard: this must actually chunk
+
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await adapter._send_on_link("room-1", content)
+
+        assert f"{len(expected)} chunk(s)" in self._posted_line(caplog).getMessage()
+
+    @pytest.mark.asyncio
+    async def test_failed_post_logs_the_room_at_error(self, adapter, caplog):
+        adapter._link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            side_effect=RuntimeError("network failure")
+        )
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await adapter._send_on_link("room-1", "hi")
+
+        assert result.success is False
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert _short_id("room-1") in errors[0].getMessage()
+        assert "network failure" in errors[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_link_lost_mid_flight_warns_that_a_reply_was_dropped(
+        self, adapter, caplog
+    ):
+        # send() marshals onto the link loop, so the link can go away between
+        # the caller's check and this one. That drop is otherwise invisible.
+        adapter._link = None
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await adapter._send_on_link("room-1", "hi")
+
+        assert result.success is False
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "Dropping send" in warnings[0].getMessage()
+        assert _short_id("room-1") in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_id_less_response_warns_that_delivery_is_unconfirmed(
+        self, adapter, caplog
+    ):
+        adapter._link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=None)
+        )
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await adapter._send_on_link("room-1", "hi")
+
+        # Band accepted it but named no message: not an error, not a clean
+        # success either, and everything downstream keys off that id.
+        assert result.success is True and result.message_id is None
+        assert any(
+            r.levelno == logging.WARNING and "unconfirmed" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_participant_fetch_logs_a_count_not_a_roster(self, caplog):
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await _fetch_participants(rest, "room-1")
+
+        counted = [r for r in caplog.records if "participant(s)" in r.getMessage()]
+        assert len(counted) == 1
+        assert "1 participant(s)" in counted[0].getMessage()
+        # Names and handles are room data, not diagnostics.
+        assert "Alice" not in caplog.text
+        assert "alice" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_message_body_never_reaches_the_log(self, adapter, caplog):
+        """The reply is the user's content; only its size may be logged."""
+        body = f"here it is: {SECRET_BODY}"
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await adapter._send_on_link("room-1", body)
+
+        assert caplog.records  # not vacuously true
+        assert SECRET_BODY not in caplog.text
+        assert f"{len(body)} chars" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_message_body_never_reaches_the_log_on_failure(
+        self, adapter, caplog
+    ):
+        adapter._link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            side_effect=RuntimeError("network failure")
+        )
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await adapter._send_on_link("room-1", f"here it is: {SECRET_BODY}")
+
+        assert caplog.records
+        assert SECRET_BODY not in caplog.text
+
+
+class TestStandaloneSendLogging:
+    """Out-of-process delivery: the error is returned AND logged.
+
+    The returned text lands in the cron job's result; an operator reading the
+    gateway log would otherwise see a delivery that never happened and never
+    explained itself.
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_credentials_are_logged(self, monkeypatch, caplog):
+        for var in ("BAND_AGENT_ID", "BAND_API_KEY", "BAND_HOME_ROOM", "BAND_HUB_ROOM"):
+            monkeypatch.delenv(var, raising=False)
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await _standalone_send(_make_config(), "room-1", "cron output")
+
+        assert "error" in result
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "BAND_AGENT_ID and BAND_API_KEY" in errors[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_missing_target_room_is_logged(self, monkeypatch, caplog):
+        monkeypatch.setenv("BAND_AGENT_ID", "agent-self")
+        monkeypatch.setenv("BAND_API_KEY", "secret-key")
+        for var in ("BAND_HOME_ROOM", "BAND_HUB_ROOM"):
+            monkeypatch.delenv(var, raising=False)
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await _standalone_send(_make_config(), "", "cron output")
+
+        assert "error" in result
+        assert any(
+            r.levelno == logging.ERROR and "no target room" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_mentionable_recipient_is_logged_with_the_count(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("BAND_AGENT_ID", "agent-self")
+        monkeypatch.setenv("BAND_API_KEY", "secret-key")
+        # Only the agent itself is in the room, so nobody can be @mentioned.
+        rest = _rest_stub([_participant("agent-self", "Bot", "bot", ptype="Agent")])
+        monkeypatch.setattr(_band_mod, "_standalone_rest", lambda *a, **k: rest)
+
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await _standalone_send(_make_config(), "room-1", "cron output")
+
+        assert "error" in result
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "1 participant(s)" in errors[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_delivery_reports_the_message_id(self, monkeypatch, caplog):
+        monkeypatch.setenv("BAND_AGENT_ID", "agent-self")
+        monkeypatch.setenv("BAND_API_KEY", "secret-key")
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        monkeypatch.setattr(_band_mod, "_standalone_rest", lambda *a, **k: rest)
+
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await _standalone_send(
+                _make_config(), "room-1", f"cron output: {SECRET_BODY}"
+            )
+
+        assert result["success"] is True
+        delivered = [r for r in caplog.records if "delivered" in r.getMessage()]
+        assert len(delivered) == 1
+        assert _short_id("std-msg-1") in delivered[0].getMessage()
+        assert SECRET_BODY not in caplog.text
