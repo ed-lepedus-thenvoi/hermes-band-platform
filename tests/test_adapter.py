@@ -3498,3 +3498,62 @@ class TestWorkingIndicator:
         reported = link.rest.agent_api_activity.report_agent_chat_activity
         assert [c.kwargs["working"] for c in reported.await_args_list] == [True, False]
         assert reported.await_args_list[0].kwargs["chat_id"] == "room-1"
+
+
+# Logger the adapter emits under; asserted against via caplog.
+_ADAPTER_LOGGER = "hermes_band_platform.adapter"
+
+
+class TestWorkingIndicatorLogging:
+    """The indicator refreshes every ~2s per turn — restraint is the point."""
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        return _make_adapter(monkeypatch)
+
+    @pytest.mark.asyncio
+    async def test_assertion_is_logged_once_per_turn_not_per_tick(
+        self, adapter, caplog
+    ):
+        adapter._link = TestWorkingIndicator._link()
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await adapter.send_typing("room-1")   # first assertion
+            await adapter.send_typing("room-1")   # inside the floor — thinned
+            TestWorkingIndicator._age(adapter, "room-1", 10)
+            await adapter.send_typing("room-1")   # past the floor — re-asserted
+
+        # Two POSTs, one line: the refreshes are deliberately silent.
+        assert adapter._link.calls == [("room-1", True), ("room-1", True)]
+        asserted = [r for r in caplog.records if "asserted" in r.getMessage()]
+        assert len(asserted) == 1
+        assert asserted[0].levelno == logging.DEBUG
+
+    @pytest.mark.asyncio
+    async def test_clearing_the_indicator_is_logged(self, adapter, caplog):
+        adapter._link = TestWorkingIndicator._link()
+        await adapter.send_typing("room-1")
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await adapter.stop_typing("room-1")
+
+        assert any("cleared" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_clear_says_the_indicator_is_still_set(
+        self, adapter, caplog
+    ):
+        adapter._link = TestWorkingIndicator._link(result=False)
+        await adapter.send_typing("room-1")
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await adapter.stop_typing("room-1")
+
+        assert any("still set" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_no_op_stop_stays_silent(self, adapter, caplog):
+        # The host calls stop several times per turn; nothing was asserted for
+        # this room, so there is nothing to say.
+        adapter._link = TestWorkingIndicator._link()
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await adapter.stop_typing("room-never-typed")
+
+        assert caplog.records == []

@@ -2379,7 +2379,17 @@ class BandAdapter(BasePlatformAdapter):
         now = time.monotonic()
         last = self._working_reported.get(chat_id)
         if last is not None and (now - last) < _WORKING_REFRESH_SECONDS:
+            # Silent on purpose: this is the thinned-out branch, taken on most
+            # of the host's ~2s ticks. Logging here would out-noise the reports
+            # it exists to suppress.
             return
+
+        if last is None:
+            # First assertion for this room — once per turn, so it is safe to
+            # say. The refreshes that follow are not logged.
+            logger.debug(
+                "[band] Working indicator asserted for room %s", _short_id(chat_id)
+            )
 
         # Stamp the ATTEMPT, not the success. A failing endpoint then retries on
         # the same floor rather than hammering every host tick, and one failed
@@ -2402,9 +2412,23 @@ class BandAdapter(BasePlatformAdapter):
         every one of them fails.
         """
         if self._link is None or chat_id not in self._working_reported:
+            # Nothing asserted for this room: the no-op that makes the host's
+            # several stop calls per turn cheap. Not worth a line each.
             return
         if await self._report_working(chat_id, False):
             self._working_reported.pop(chat_id, None)
+            logger.debug(
+                "[band] Working indicator cleared for room %s", _short_id(chat_id)
+            )
+        else:
+            # _report_working logged the cause; this says what it cost — the
+            # room keeps "Reasoning…" until a later stop call or the platform
+            # TTL takes it down.
+            logger.debug(
+                "[band] Working indicator for room %s still set — clear failed, "
+                "will retry on the next stop",
+                _short_id(chat_id),
+            )
 
     async def _report_working(self, chat_id: str, working: bool) -> bool:
         """POST the boolean working state. Never raises into the turn.
@@ -2425,6 +2449,13 @@ class BandAdapter(BasePlatformAdapter):
         link = self._link
         report = getattr(link, "report_activity", None) if link is not None else None
         if report is None:
+            # Bounded by the same throttle a real report is, so this can never
+            # be noisier than the feature it stands in for.
+            logger.debug(
+                "[band] No working indicator for room %s — this band-sdk has no "
+                "activity API",
+                _short_id(chat_id),
+            )
             return False
         try:
             return bool(await report(chat_id, working))
