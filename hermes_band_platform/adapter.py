@@ -2617,6 +2617,16 @@ def register(ctx) -> None:
             emoji=emoji,
         )
 
+    # Execution events: mirror the agent's tool calls into the Band room's
+    # context stream, so a user watching a long turn sees the work instead of
+    # silence. Registered here because the host's only *wired* tool-observation
+    # contract is the plugin hook API (``pre_tool_call`` / ``post_tool_call``) —
+    # no adapter-facing hook carries a tool's args, output and call id. Full
+    # reasoning in ``execution_events.py``.
+    from . import execution_events as _execution_events
+
+    _execution_events.register_hooks(ctx)
+
     # Bundle the guided-setup skill so pip installs ship it. Best-effort: a
     # missing file or an older host without ``register_skill`` must never break
     # plugin load.

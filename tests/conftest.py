@@ -13,6 +13,7 @@ If the real ``band-sdk`` is installed, we leave it in place.
 from __future__ import annotations
 
 import sys
+from enum import StrEnum
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -71,6 +72,32 @@ def _install_band_mock() -> MagicMock:
         def __init__(self, task_id=None):
             self.task_id = task_id
 
+    class _FakeChatEventRequest:
+        def __init__(self, content, message_type, metadata=None):
+            self.content = content
+            self.message_type = message_type
+            self.metadata = metadata
+
+    # band.core.types — the canonical event taxonomy the execution-event
+    # emitter keys its payloads by. Real StrEnums, because the SDK relies on
+    # members *being* their string values (a payload keyed by ToolEventKey
+    # json.dumps'es to plain "name"/"args"/… keys).
+    class _FakeMessageType(StrEnum):
+        TEXT = "text"
+        TOOL_CALL = "tool_call"
+        TOOL_RESULT = "tool_result"
+        THOUGHT = "thought"
+        ERROR = "error"
+        TASK = "task"
+        USAGE = "usage"
+
+    class _FakeToolEventKey(StrEnum):
+        NAME = "name"
+        ARGS = "args"
+        OUTPUT = "output"
+        TOOL_CALL_ID = "tool_call_id"
+        IS_ERROR = "is_error"
+
     # band.runtime.formatters — pure helper the adapter reuses. Faithful
     # stand-in for replace_uuid_mentions so the adapter's independent import
     # binds the stub rather than its passthrough fallback.
@@ -92,10 +119,15 @@ def _install_band_mock() -> MagicMock:
     band_client_rest_mod.ChatMessageRequestMentionsItem = _FakeChatMessageRequestMentionsItem
     band_client_rest_mod.ParticipantRequest = _FakeParticipantRequest
     band_client_rest_mod.ChatRoomRequest = _FakeChatRoomRequest
+    band_client_rest_mod.ChatEventRequest = _FakeChatEventRequest
     band_client_rest_mod.DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
     band_runtime_mod = MagicMock()
     band_runtime_formatters_mod = MagicMock()
     band_runtime_formatters_mod.replace_uuid_mentions = _fake_replace_uuid_mentions
+    band_core_mod = MagicMock()
+    band_core_types_mod = MagicMock()
+    band_core_types_mod.MessageType = _FakeMessageType
+    band_core_types_mod.ToolEventKey = _FakeToolEventKey
 
     sys.modules["band"] = band_mod
     sys.modules["band.platform"] = band_platform_mod
@@ -103,6 +135,8 @@ def _install_band_mock() -> MagicMock:
     sys.modules["band.platform.event"] = band_platform_event_mod
     sys.modules["band.client"] = band_client_mod
     sys.modules["band.client.rest"] = band_client_rest_mod
+    sys.modules["band.core"] = band_core_mod
+    sys.modules["band.core.types"] = band_core_types_mod
     sys.modules["band.runtime"] = band_runtime_mod
     sys.modules["band.runtime.formatters"] = band_runtime_formatters_mod
 
@@ -172,6 +206,9 @@ def _register_band_platform():
                 pass
 
             def register_skill(self, *args, **kwargs):
+                pass
+
+            def register_hook(self, hook_name, callback):
                 pass
 
         hermes_band_platform.register(_RegistryCtx())
