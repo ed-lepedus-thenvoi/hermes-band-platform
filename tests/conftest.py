@@ -40,7 +40,31 @@ def _install_band_mock() -> MagicMock:
             self.subscribe_room = AsyncMock()
             self.unsubscribe_room = AsyncMock()
             self.rest = MagicMock()
+            # Activity/presence group — the working indicator posts here. The
+            # real client is
+            # ``report_agent_chat_activity(chat_id, *, working, request_options)``.
+            self.rest.agent_api_activity.report_agent_chat_activity = AsyncMock()
             self._events = []
+
+        async def report_activity(self, room_id, working, *, timeout_seconds=2):
+            """Faithful stand-in for ``BandLink.report_activity``.
+
+            Same contract as the real helper: delegates to the activity REST
+            group with a per-POST deadline and retries disabled, swallows any
+            failure, and reports success as a bool.
+            """
+            try:
+                await self.rest.agent_api_activity.report_agent_chat_activity(
+                    chat_id=room_id,
+                    working=working,
+                    request_options={
+                        "timeout_in_seconds": timeout_seconds,
+                        "max_retries": 0,
+                    },
+                )
+            except Exception:
+                return False
+            return True
 
         def __aiter__(self):
             return self

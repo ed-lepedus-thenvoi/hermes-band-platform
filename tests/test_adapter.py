@@ -3277,3 +3277,224 @@ class TestHubFailover:
         await adapter._record_hub_send("old-hub", ok=False)
 
         link.rest.agent_api_chats.create_agent_chat.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 20. Working indicator (Band activity API)
+# ---------------------------------------------------------------------------
+
+class TestWorkingIndicator:
+    """send_typing / stop_typing drive Band's boolean activity surface.
+
+    The indicator is live state with a ~10s platform TTL, so these tests pin
+    both halves of the guard: repeats inside the refresh floor are thinned, and
+    a repeat *past* the floor still re-asserts (otherwise the bubble would die
+    mid-turn).
+    """
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        return _make_adapter(monkeypatch)
+
+    @staticmethod
+    def _link(result=True, raises=None):
+        """A link whose report_activity records calls as (room_id, working)."""
+        link = MagicMock()
+        calls = []
+
+        async def _report(room_id, working, *, timeout_seconds=2):
+            calls.append((room_id, working))
+            if raises is not None:
+                raise raises
+            return result
+
+        link.report_activity = _report
+        link.calls = calls
+        return link
+
+    @staticmethod
+    def _age(adapter, chat_id, seconds):
+        """Backdate a room's last report so the refresh floor has elapsed."""
+        adapter._working_reported[chat_id] = (
+            adapter._working_reported[chat_id] - seconds
+        )
+
+    # ── Reporting ──
+
+    @pytest.mark.asyncio
+    async def test_send_typing_reports_working_true(self, adapter):
+        adapter._link = self._link()
+        await adapter.send_typing("room-1")
+        assert adapter._link.calls == [("room-1", True)]
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_reports_working_false(self, adapter):
+        adapter._link = self._link()
+        await adapter.send_typing("room-1")
+        await adapter.stop_typing("room-1")
+        assert adapter._link.calls == [("room-1", True), ("room-1", False)]
+
+    @pytest.mark.asyncio
+    async def test_reports_are_per_chat(self, adapter):
+        adapter._link = self._link()
+        await adapter.send_typing("room-a")
+        await adapter.send_typing("room-b")
+        assert adapter._link.calls == [("room-a", True), ("room-b", True)]
+
+    @pytest.mark.asyncio
+    async def test_send_typing_accepts_metadata(self, adapter):
+        # The host passes thread metadata positionally/by keyword on every tick;
+        # Band ignores it (rooms aren't threaded) but must still accept it.
+        adapter._link = self._link()
+        await adapter.send_typing("room-1", metadata={"thread_id": "t-1"})
+        assert adapter._link.calls == [("room-1", True)]
+
+    # ── The refresh floor ──
+
+    @pytest.mark.asyncio
+    async def test_repeat_within_floor_does_not_hit_the_network(self, adapter):
+        adapter._link = self._link()
+        for _ in range(5):
+            await adapter.send_typing("room-1")
+        assert adapter._link.calls == [("room-1", True)]
+
+    @pytest.mark.asyncio
+    async def test_repeat_past_floor_reasserts(self, adapter):
+        # Critical: the platform expires the indicator ~10s after the last
+        # report, so the guard must thin refreshes, never stop them.
+        adapter._link = self._link()
+        await adapter.send_typing("room-1")
+        self._age(adapter, "room-1", _band_mod._WORKING_REFRESH_SECONDS + 1)
+        await adapter.send_typing("room-1")
+        assert adapter._link.calls == [("room-1", True), ("room-1", True)]
+
+    @pytest.mark.asyncio
+    async def test_floor_is_within_the_platform_ttl_headroom(self, adapter):
+        # The SDK's rule is cadence < TTL/2. The host refreshes every ~2s, so
+        # the effective cadence is floor rounded up to the next tick (4s here).
+        assert 0 < _band_mod._WORKING_REFRESH_SECONDS < 5.0
+
+    @pytest.mark.asyncio
+    async def test_new_turn_reasserts_after_stop(self, adapter):
+        adapter._link = self._link()
+        await adapter.send_typing("room-1")
+        await adapter.stop_typing("room-1")
+        # A fresh turn must light the indicator immediately — the floor from the
+        # previous turn must not suppress it.
+        await adapter.send_typing("room-1")
+        assert adapter._link.calls == [
+            ("room-1", True),
+            ("room-1", False),
+            ("room-1", True),
+        ]
+
+    # ── Repeated / spurious stops ──
+
+    @pytest.mark.asyncio
+    async def test_stop_without_start_is_a_no_op(self, adapter):
+        adapter._link = self._link()
+        await adapter.stop_typing("never-started")
+        assert adapter._link.calls == []
+
+    @pytest.mark.asyncio
+    async def test_repeated_stops_hit_the_network_once(self, adapter):
+        # The host stops several times per turn (_stop_typing_refresh retries
+        # twice, plus _keep_typing's finally).
+        adapter._link = self._link()
+        await adapter.send_typing("room-1")
+        for _ in range(3):
+            await adapter.stop_typing("room-1")
+        assert adapter._link.calls == [("room-1", True), ("room-1", False)]
+
+    @pytest.mark.asyncio
+    async def test_failed_stop_is_retried_by_the_next_stop(self, adapter):
+        # A clear that didn't land keeps the room asserted, so the host's own
+        # repeat becomes the retry.
+        adapter._link = self._link(result=False)
+        await adapter.send_typing("room-1")
+        await adapter.stop_typing("room-1")
+        await adapter.stop_typing("room-1")
+        assert adapter._link.calls == [
+            ("room-1", True),
+            ("room-1", False),
+            ("room-1", False),
+        ]
+
+    # ── Robustness ──
+
+    @pytest.mark.asyncio
+    async def test_raising_report_does_not_propagate_from_send_typing(self, adapter):
+        adapter._link = self._link(raises=RuntimeError("activity endpoint down"))
+        await adapter.send_typing("room-1")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_raising_report_does_not_propagate_from_stop_typing(self, adapter):
+        adapter._link = self._link()
+        await adapter.send_typing("room-1")
+        adapter._link.report_activity = AsyncMock(side_effect=RuntimeError("boom"))
+        await adapter.stop_typing("room-1")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_failing_report_still_respects_the_floor(self, adapter):
+        # The attempt is stamped, not the success — a dead endpoint must not be
+        # hammered on every host tick.
+        adapter._link = self._link(raises=RuntimeError("down"))
+        for _ in range(5):
+            await adapter.send_typing("room-1")
+        assert adapter._link.calls == [("room-1", True)]
+
+    @pytest.mark.asyncio
+    async def test_old_sdk_without_report_activity_is_a_no_op(self, adapter):
+        link = MagicMock()
+        del link.report_activity
+        adapter._link = link
+        await adapter.send_typing("room-1")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_cache_is_capped(self, adapter):
+        adapter._link = self._link()
+        for i in range(_band_mod._ROOM_CACHE_MAX + 10):
+            await adapter.send_typing(f"room-{i}")
+        assert len(adapter._working_reported) <= _band_mod._ROOM_CACHE_MAX
+
+    # ── No live link (standalone / out-of-process) ──
+
+    @pytest.mark.asyncio
+    async def test_send_typing_without_link_is_a_no_op(self, adapter):
+        assert adapter._link is None  # as constructed
+        await adapter.send_typing("room-1")
+        # No state recorded either — nothing to clear later.
+        assert adapter._working_reported == {}
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_without_link_is_a_no_op(self, adapter):
+        adapter._link = self._link()
+        await adapter.send_typing("room-1")
+        adapter._link = None
+        await adapter.stop_typing("room-1")  # must not raise
+
+    # ── Capability flag: the deliberate non-declaration ──
+
+    def test_does_not_claim_status_text_support(self, adapter):
+        # The activity API carries a bare boolean and the platform renders its
+        # own "Reasoning…" label, so there is nowhere to put a status phrase.
+        # Declaring support would make the host compute phrases we discard.
+        assert adapter.supports_status_text is False
+
+    # ── Wire level, through the SDK stub ──
+
+    @pytest.mark.asyncio
+    async def test_reaches_the_activity_rest_group(self, adapter):
+        from band.platform.link import BandLink
+
+        link = BandLink("agent", "key", "wss://h/ws", "https://h")
+        if not isinstance(link.rest, MagicMock):
+            pytest.skip("real band-sdk installed; stub-only wire assertion")
+        adapter._link = link
+
+        await adapter.send_typing("room-1")
+        await adapter.stop_typing("room-1")
+
+        reported = link.rest.agent_api_activity.report_agent_chat_activity
+        assert [c.kwargs["working"] for c in reported.await_args_list] == [True, False]
+        assert reported.await_args_list[0].kwargs["chat_id"] == "room-1"

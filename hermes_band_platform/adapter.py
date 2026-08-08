@@ -132,6 +132,23 @@ _ROOM_CACHE_MAX = 2000
 # so a server that pathologically re-offers an un-ackable message can't spin.
 _MAX_DRAIN_IDLESS_SKIPS = 50
 
+# Minimum gap between two ``working: true`` reports for the same room.
+#
+# The Band working indicator is LIVE STATE with a server-side TTL, not a latch:
+# the platform expires it ~10s after the last report (the SDK pins this as
+# ``band.runtime.types.PLATFORM_WORKING_STATE_TTL_SECONDS = 10.0``), so it has to
+# be re-asserted for as long as the turn runs. A plain "same state → skip" dedup
+# would therefore be WRONG, not merely thrifty: it would report ``working`` once
+# and let the indicator die 10s into a two-minute turn. The guard is a time
+# floor instead — the host's ~2s typing refresh is thinned to one POST per this
+# many seconds.
+#
+# 3.0s mirrors the SDK's own keep-alive default (``SessionConfig
+# .working_keep_alive_seconds``) and yields an effective 4s cadence against a 2s
+# host tick, which keeps the SDK's ``cadence < TTL/2`` (5s) headroom rule — so a
+# single dropped report still lands inside the TTL. Do NOT raise this past 5s.
+_WORKING_REFRESH_SECONDS = 3.0
+
 # Session/source chat_type for every Band room. Band has no DMs — every room is
 # a group room regardless of participant count, mention-gated for all
 # participants — and ``group_sessions_per_user`` is locked False, so a single
@@ -477,6 +494,27 @@ class BandAdapter(BasePlatformAdapter):
     # conservative safe default; revisit once Band documents a hard cap.
     MAX_MESSAGE_LENGTH = 4000
 
+    # ── Working-indicator capability ──────────────────────────────────────
+    # ``supports_status_text`` is deliberately LEFT UNSET (False, from the base).
+    #
+    # The flag asserts "this adapter's typing indicator renders TEXT rather than
+    # a native textless bubble" — that assertion is what makes the host compute
+    # live per-tool phrases, hand them over via ``set_status_text()``, and expect
+    # ``send_typing()`` to render them. Band's indicator is squarely the textless
+    # kind the base class says should keep the default: the whole API surface is
+    # ``report_agent_chat_activity(chat_id, *, working: bool)``, a single boolean
+    # with no text field, and the platform renders its own fixed "Reasoning…"
+    # label server-side. There is nowhere to put a phrase and nothing a phrase
+    # could change, so setting the flag would only make the gateway build and
+    # store status text we then drop on the floor (gateway/run.py gates the
+    # entire live-status path on exactly this attribute).
+    #
+    # Posting the phrase instead is NOT the missing use: that would put per-tool
+    # chatter into permanent room history, which is the precise thing the
+    # activity API exists to avoid. Nor is "use it as a change signal to force an
+    # early refresh" — ``working`` is already true, so the extra POST would buy
+    # the user no visible change at all.
+
     def __init__(self, config: PlatformConfig, **kwargs):
         super().__init__(config, Platform("band"))
 
@@ -544,6 +582,13 @@ class BandAdapter(BasePlatformAdapter):
         # server re-offers (NOT persisted — after restart the server cursor wins).
         self._sent_ids: set = set()
         self._seen_inbound_ids: set = set()
+
+        # ── Working indicator ──
+        # room id → monotonic timestamp of the last ``working: true`` report
+        # ATTEMPT. Presence means "we have asserted working for this room and not
+        # yet cleared it"; the timestamp drives the refresh floor. See
+        # _WORKING_REFRESH_SECONDS and send_typing/stop_typing.
+        self._working_reported: Dict[str, float] = {}
 
         # ── Hub failover ──
         # On repeated hub-send failures (message limit / persistent error) create
@@ -2305,6 +2350,92 @@ class BandAdapter(BasePlatformAdapter):
             term in text
             for term in ("timeout", "timed out", "connection", "temporarily", "unavailable")
         )
+
+    # ── Working indicator (activity API) ──────────────────────────────────
+
+    async def send_typing(
+        self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Report ``working: true`` for a room — Band's "Reasoning…" indicator.
+
+        This drives Band's activity/presence surface, which is deliberately
+        NEITHER a message NOR an event: it cannot appear in room history at all.
+        A Hermes turn here can run for minutes, and without this the user sees
+        nothing whatsoever between sending a message and getting a reply.
+
+        Driven by the host's ``_keep_typing`` refresh loop (~every 2s); the
+        reports are thinned to one POST per ``_WORKING_REFRESH_SECONDS``. See
+        that constant for why the guard is a time floor and not a state dedup.
+
+        ``metadata`` is accepted for interface parity (Slack routes per-thread
+        status through it) and unused — Band rooms aren't threaded, so the room
+        id is the entire address.
+        """
+        if self._link is None:
+            # No live link: the standalone / out-of-process path (cron senders,
+            # tool callers) has nothing to report on, and must not record state.
+            return
+
+        now = time.monotonic()
+        last = self._working_reported.get(chat_id)
+        if last is not None and (now - last) < _WORKING_REFRESH_SECONDS:
+            return
+
+        # Stamp the ATTEMPT, not the success. A failing endpoint then retries on
+        # the same floor rather than hammering every host tick, and one failed
+        # report still leaves the following attempt inside the platform TTL.
+        self._working_reported[chat_id] = now
+        self._cap_cache(self._working_reported, _ROOM_CACHE_MAX)
+        await self._report_working(chat_id, True)
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Clear the working indicator for a room (``working: false``).
+
+        Never throttled: a stale "Reasoning…" would otherwise outlive the reply
+        by the whole platform TTL. Repeats are made cheap instead — with nothing
+        asserted for the room this is a no-op, so the host's several stop calls
+        per turn (``_stop_typing_refresh`` retries twice, plus ``_keep_typing``'s
+        finally block) cost one POST between them.
+
+        The room is forgotten only once the clear actually succeeds, which turns
+        those repeats into the retry; the platform TTL backstops the case where
+        every one of them fails.
+        """
+        if self._link is None or chat_id not in self._working_reported:
+            return
+        if await self._report_working(chat_id, False):
+            self._working_reported.pop(chat_id, None)
+
+    async def _report_working(self, chat_id: str, working: bool) -> bool:
+        """POST the boolean working state. Never raises into the turn.
+
+        Goes through ``BandLink.report_activity`` rather than reaching for
+        ``rest.agent_api_activity`` directly: that helper is purpose-built for
+        this call and already applies a per-POST deadline with retries disabled
+        (a dropped keep-alive is re-sent on the next tick and a dropped clear is
+        caught by the TTL, so retrying would only add latency), and it reports
+        failure as ``False`` instead of raising. The ``except`` is the belt to
+        that helper's braces — an indicator must never be able to break message
+        delivery, which is the only thing that actually matters.
+
+        Missing on a band-sdk predating the activity API; treated as "cannot
+        report" rather than an error, mirroring how this module tolerates an
+        older SDK elsewhere (see ``replace_uuid_mentions``).
+        """
+        link = self._link
+        report = getattr(link, "report_activity", None) if link is not None else None
+        if report is None:
+            return False
+        try:
+            return bool(await report(chat_id, working))
+        except Exception as e:
+            logger.debug(
+                "[band] Activity report (working=%s) failed for room %s: %s",
+                working,
+                _short_id(chat_id),
+                e,
+            )
+            return False
 
     # ── Chat info ─────────────────────────────────────────────────────────
 
