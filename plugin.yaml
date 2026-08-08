@@ -67,3 +67,7 @@ optional_env:
     description: "Split a group room into a separate session per participant (true) or keep one shared session for the whole room (false). Default false — a Band room is one shared channel."
     prompt: "Per-user group sessions? (true/false, default false)"
     password: false
+  - name: BAND_EMIT_USAGE
+    description: "Where per-turn token-usage events are posted: 'all' (default) the room the turn ran in, 'hub' only the owner's private control room, 'off' never (also skips registering the host's per-API-call hook). Band has no per-room event-visibility control, so this is one global policy."
+    prompt: "Emit usage events? (all/hub/off, default all)"
+    password: false

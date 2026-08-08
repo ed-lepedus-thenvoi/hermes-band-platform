@@ -71,6 +71,85 @@ def _install_band_mock() -> MagicMock:
         def __init__(self, task_id=None):
             self.task_id = task_id
 
+    class _FakeChatEventRequest:
+        def __init__(self, content, message_type, metadata=None):
+            self.content = content
+            self.message_type = message_type
+            self.metadata = metadata
+
+    # band.core.types — the SDK's usage contract, mirrored faithfully because
+    # usage_events.py builds its per-turn accumulator on TurnUsage's arithmetic
+    # and serialization, and posts under the two constants. See the note in the
+    # real module: usage rides an accepted ``task`` event today because the
+    # backend's message_type whitelist rejects ``usage``.
+    def _as_int(value):
+        return value if isinstance(value, int) else 0
+
+    class _FakeTurnUsage:
+        def __init__(
+            self,
+            input_tokens=0,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+        ):
+            self.input_tokens = input_tokens
+            self.output_tokens = output_tokens
+            self.cache_read_tokens = cache_read_tokens
+            self.cache_write_tokens = cache_write_tokens
+
+        def __add__(self, other):
+            return _FakeTurnUsage(
+                input_tokens=self.input_tokens + other.input_tokens,
+                output_tokens=self.output_tokens + other.output_tokens,
+                cache_read_tokens=self.cache_read_tokens + other.cache_read_tokens,
+                cache_write_tokens=self.cache_write_tokens + other.cache_write_tokens,
+            )
+
+        @property
+        def total_tokens(self):
+            return self.input_tokens + self.output_tokens
+
+        @property
+        def is_empty(self):
+            return not (
+                self.input_tokens
+                or self.output_tokens
+                or self.cache_read_tokens
+                or self.cache_write_tokens
+            )
+
+        def to_dict(self):
+            return {
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "cache_read_tokens": self.cache_read_tokens,
+                "cache_write_tokens": self.cache_write_tokens,
+            }
+
+        @classmethod
+        def from_mapping(
+            cls,
+            data,
+            *,
+            input,
+            output,
+            cache_read=None,
+            cache_write=None,
+            reasoning=None,
+        ):
+            if not isinstance(data, dict):
+                return cls()
+            out = _as_int(data.get(output, 0))
+            if reasoning:
+                out += _as_int(data.get(reasoning, 0))
+            return cls(
+                input_tokens=_as_int(data.get(input, 0)),
+                output_tokens=out,
+                cache_read_tokens=_as_int(data.get(cache_read, 0)) if cache_read else 0,
+                cache_write_tokens=_as_int(data.get(cache_write, 0)) if cache_write else 0,
+            )
+
     # band.runtime.formatters — pure helper the adapter reuses. Faithful
     # stand-in for replace_uuid_mentions so the adapter's independent import
     # binds the stub rather than its passthrough fallback.
@@ -93,6 +172,12 @@ def _install_band_mock() -> MagicMock:
     band_client_rest_mod.ParticipantRequest = _FakeParticipantRequest
     band_client_rest_mod.ChatRoomRequest = _FakeChatRoomRequest
     band_client_rest_mod.DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
+    band_client_rest_mod.ChatEventRequest = _FakeChatEventRequest
+    band_core_mod = MagicMock()
+    band_core_types_mod = MagicMock()
+    band_core_types_mod.TurnUsage = _FakeTurnUsage
+    band_core_types_mod.USAGE_EVENT_TYPE = "task"
+    band_core_types_mod.USAGE_METADATA_KEY = "band_usage"
     band_runtime_mod = MagicMock()
     band_runtime_formatters_mod = MagicMock()
     band_runtime_formatters_mod.replace_uuid_mentions = _fake_replace_uuid_mentions
@@ -103,6 +188,8 @@ def _install_band_mock() -> MagicMock:
     sys.modules["band.platform.event"] = band_platform_event_mod
     sys.modules["band.client"] = band_client_mod
     sys.modules["band.client.rest"] = band_client_rest_mod
+    sys.modules["band.core"] = band_core_mod
+    sys.modules["band.core.types"] = band_core_types_mod
     sys.modules["band.runtime"] = band_runtime_mod
     sys.modules["band.runtime.formatters"] = band_runtime_formatters_mod
 

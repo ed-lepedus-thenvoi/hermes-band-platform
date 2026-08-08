@@ -53,6 +53,7 @@ from gateway.platforms.base import (  # noqa: E402
 from gateway.session import SessionSource, build_session_key  # noqa: E402
 
 from . import _band_libs  # noqa: E402  (stdlib-only shim; safe at module top)
+from . import usage_events  # noqa: E402  (carries its own SDK guard)
 
 logger = logging.getLogger(__name__)
 
@@ -562,6 +563,12 @@ class BandAdapter(BasePlatformAdapter):
 
         # Scoped-lock identity (best-effort; set in connect()).
         self._lock_identity: Optional[str] = None
+
+        # Make this adapter reachable from the per-turn usage hooks, which fire
+        # on the agent's thread with no adapter reference of their own. Held
+        # weakly there, so tracking here (rather than in connect/disconnect)
+        # costs nothing and cannot outlive the adapter.
+        usage_events.track_adapter(self)
 
     @property
     def name(self) -> str:
@@ -2651,3 +2658,8 @@ def register(ctx) -> None:
         pass
     except Exception as e:
         logger.debug("[band] Skill registration skipped: %s", e)
+
+    # Per-turn token-usage events (see usage_events.py). Self-gating: a no-op
+    # on an SDK without the usage contract, a host without register_hook, or
+    # when BAND_EMIT_USAGE turns it off.
+    usage_events.register_hooks(ctx)
