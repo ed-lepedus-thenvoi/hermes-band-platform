@@ -22,13 +22,24 @@ import hermes_band_platform.usage_events as ue
 
 @pytest.fixture(autouse=True)
 def _clean_module_state(monkeypatch):
-    """Isolate the module globals — both are process-wide by design."""
+    """Isolate the module globals — both are process-wide by design.
+
+    Leaves BAND_EMIT_USAGE UNSET, so every test starts from the shipped default
+    (off). Tests that exercise emission opt in via the ``emit_all`` fixture,
+    which keeps their dependence on non-default config visible.
+    """
     ue._PENDING.clear()
     ue._ACTIVE_ADAPTERS.clear()
     monkeypatch.delenv("BAND_EMIT_USAGE", raising=False)
     yield
     ue._PENDING.clear()
     ue._ACTIVE_ADAPTERS.clear()
+
+
+@pytest.fixture
+def emit_all(monkeypatch):
+    """Opt into emission. Required by anything asserting an event is produced."""
+    monkeypatch.setenv("BAND_EMIT_USAGE", "all")
 
 
 def _usage(inp=0, out=0, cache_read=0, cache_write=0, reasoning=0):
@@ -112,6 +123,7 @@ def _scheduled(monkeypatch):
 # 1. Accumulation across a turn
 # ---------------------------------------------------------------------------
 
+@pytest.mark.usefixtures("emit_all")
 class TestAccumulation:
 
     def test_calls_are_summed_into_one_turn_event(self, monkeypatch):
@@ -193,7 +205,10 @@ class TestAccumulation:
 # 2. What is skipped
 # ---------------------------------------------------------------------------
 
+@pytest.mark.usefixtures("emit_all")
 class TestSkipped:
+    """Emission is ON for these — so a missing event pins the stated reason,
+    not the default."""
 
     def test_other_platforms_are_ignored(self, monkeypatch):
         adapter = _FakeAdapter(rooms=["room-a"], session_map={"room-a": "sid-1"})
@@ -342,7 +357,42 @@ class TestRoomResolution:
 
 class TestScope:
 
-    def test_default_is_the_room_the_turn_ran_in(self, monkeypatch):
+    def test_default_is_off(self, monkeypatch):
+        """Shipped default: nothing is emitted anywhere. Off until a consumer
+        for band_usage exists — see _scope()."""
+        assert ue._scope() == ue.SCOPE_OFF
+
+    def test_default_emits_nothing_for_a_complete_turn(self, monkeypatch):
+        """The whole pipeline runs (band platform, resolvable room, real
+        tokens) and still produces no event, purely because of the default."""
+        adapter = _FakeAdapter(
+            rooms=["room-a"], session_map={"room-a": "sid-1"}, hub_room_id="hub-1"
+        )
+        ue.track_adapter(adapter)
+        calls = _scheduled(monkeypatch)
+
+        ue.on_post_api_request(**_api_call(usage=_usage(inp=100, out=20)))
+        ue.on_post_llm_call(**_turn_end())
+
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_default_posts_nothing_to_band(self):
+        """End to end, with no _schedule_emit stub in the way: the Band REST
+        events endpoint is never called."""
+        loop = asyncio.get_running_loop()
+        adapter = _FakeAdapter(
+            rooms=["room-a"], session_map={"room-a": "sid-1"}, loop=loop
+        )
+        ue.track_adapter(adapter)
+
+        ue.on_post_api_request(**_api_call(usage=_usage(inp=100, out=20)))
+        ue.on_post_llm_call(**_turn_end())
+        await asyncio.sleep(0)
+
+        adapter.sent.assert_not_awaited()
+
+    def test_all_scope_emits_in_the_room_the_turn_ran_in(self, monkeypatch, emit_all):
         adapter = _FakeAdapter(
             rooms=["room-a"], session_map={"room-a": "sid-1"}, hub_room_id="hub-1"
         )
@@ -392,8 +442,18 @@ class TestScope:
 
         assert calls == []
 
-    def test_unknown_value_falls_back_to_all(self, monkeypatch):
+    def test_unknown_value_falls_back_to_off(self, monkeypatch):
+        """A typo must not silently start emitting."""
         monkeypatch.setenv("BAND_EMIT_USAGE", "banana")
+        assert ue._scope() == ue.SCOPE_OFF
+
+    def test_empty_value_is_off(self, monkeypatch):
+        monkeypatch.setenv("BAND_EMIT_USAGE", "   ")
+        assert ue._scope() == ue.SCOPE_OFF
+
+    @pytest.mark.parametrize("value", ["all", "ALL", "true", "1", "yes", "on"])
+    def test_truthy_spellings_opt_in(self, monkeypatch, value):
+        monkeypatch.setenv("BAND_EMIT_USAGE", value)
         assert ue._scope() == ue.SCOPE_ALL
 
 
@@ -517,7 +577,7 @@ class TestScheduling:
 
 class TestRegistration:
 
-    def test_registers_both_hooks(self):
+    def test_registers_both_hooks_when_opted_in(self, emit_all):
         registered = {}
         ctx = SimpleNamespace(register_hook=lambda name, cb: registered.__setitem__(name, cb))
 
@@ -525,9 +585,18 @@ class TestRegistration:
         assert registered["post_api_request"] is ue.on_post_api_request
         assert registered["post_llm_call"] is ue.on_post_llm_call
 
-    def test_off_skips_registration_entirely(self, monkeypatch):
-        """Registering post_api_request makes the host build a sanitized
-        response payload per API call — 'off' must not pay for that."""
+    def test_default_registers_nothing(self):
+        """The property that matters most now that off is the default:
+        registering post_api_request makes the host build a sanitized response
+        payload for EVERY API call, and nobody should pay that for a feature
+        they did not opt into."""
+        registered = {}
+        ctx = SimpleNamespace(register_hook=lambda name, cb: registered.__setitem__(name, cb))
+
+        assert ue.register_hooks(ctx) is False
+        assert registered == {}
+
+    def test_explicit_off_registers_nothing(self, monkeypatch):
         monkeypatch.setenv("BAND_EMIT_USAGE", "off")
         registered = {}
         ctx = SimpleNamespace(register_hook=lambda name, cb: registered.__setitem__(name, cb))
@@ -535,10 +604,20 @@ class TestRegistration:
         assert ue.register_hooks(ctx) is False
         assert registered == {}
 
-    def test_older_host_without_register_hook(self):
+    def test_plugin_registration_wires_no_hooks_by_default(self, monkeypatch):
+        """Through the real plugin entry point, not just register_hooks()."""
+        monkeypatch.setenv("BAND_AGENT_ID", "a")
+        monkeypatch.setenv("BAND_API_KEY", "k")
+        ctx = MagicMock()
+
+        _band_mod.register(ctx)
+
+        ctx.register_hook.assert_not_called()
+
+    def test_older_host_without_register_hook(self, emit_all):
         assert ue.register_hooks(SimpleNamespace()) is False
 
-    def test_sdk_without_the_usage_contract(self, monkeypatch):
+    def test_sdk_without_the_usage_contract(self, monkeypatch, emit_all):
         monkeypatch.setattr(ue, "USAGE_SDK_AVAILABLE", False)
         ctx = SimpleNamespace(register_hook=MagicMock())
 

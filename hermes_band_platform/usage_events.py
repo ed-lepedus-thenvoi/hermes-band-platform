@@ -36,7 +36,11 @@ the platform gains the type.  We import those constants rather than hardcoding
 ``MessageType.USAGE``, so this plugin follows the platform automatically:
 
     USAGE_EVENT_TYPE   -> MessageType.TASK  (today)
-    USAGE_METADATA_KEY -> "band_usage"      (what a reader filters on)
+    USAGE_METADATA_KEY -> "band_usage"      (what a reader would filter on)
+
+Emission is OFF by default, though — the SDK justifies riding a ``task`` event
+on the grounds that the read side filters on ``band_usage``, and there is no
+read side yet.  See ``_scope()``.
 
 Everything here is best-effort: a failed emit, an unresolvable room or a
 missing SDK must never affect the turn.  Events are exempt from Band's
@@ -149,32 +153,48 @@ _PENDING_LOCK = threading.Lock()
 
 
 def _scope() -> str:
-    """Which rooms usage events go to.
+    """Which rooms usage events go to.  ``BAND_EMIT_USAGE``, default ``off``.
 
     Read per call so a change takes effect without a gateway restart, and so
     the policy is testable without re-registering hooks.
 
-    Band exposes no per-room switch for event visibility (the SDK's own gate,
-    ``Emit.USAGE``, is a single adapter-wide flag), and the Hermes plugin API
-    has no per-room config.  So the honest choice is a global default plus an
-    escape hatch:
+      off (default) — never emit; the hooks are not registered at all.
+      all           — emit into the room the turn ran in.
+      hub           — emit only in the owner's private control room, for
+                      operators who do not want spend shown to the other
+                      participants of a shared group room.
 
-      all  (default) — emit into the room the turn ran in.  "Token spend per
-                       room" is the point of the feature, and a usage event is
-                       strictly less revealing than the tool_call/tool_result
-                       events the plugin already posts to every room.
-      hub            — emit only in the owner's private control room, for
-                       operators who do not want spend shown to the other
-                       participants of a shared group room.
-      off            — never emit; the hooks are not registered at all.
+    WHY OFF BY DEFAULT.  Not because the event shape is wrong: it follows the
+    SDK's usage contract exactly and stays forward-compatible with it.  But the
+    SDK justifies riding a ``task`` event on the grounds that "the read side
+    filters on that key" — and as of 2026-08 no read side exists.  ``band_usage``
+    appears nowhere in the Jam client; the per-agent meters that look like usage
+    are provider ACCOUNT rate-limit windows owned by the Jam daemon, unrelated
+    to per-turn spend.  So the event's only observable effect today is a "Task"
+    chip in the room transcript reading ``Token usage: input=… output=…``, and
+    ``task`` is meant for work items and coordination, not telemetry.  Opt-in
+    until that changes.
+
+    WHEN TO FLIP IT BACK.  Once a consumer lands, ``all`` is the right default —
+    per-room visibility is the point of the feature, and a usage event is
+    strictly less revealing than the tool_call/tool_result events already posted
+    to every room.  The upstream signal is ``USAGE_EVENT_TYPE`` becoming
+    ``MessageType.USAGE``: ``band/core/types.py`` documents that as a one-line
+    flip, and it can only happen once the backend accepts the type, which is
+    itself the point at which a first-class reader is plausible.
+
+    Band exposes no per-room switch for event visibility (the SDK's own gate,
+    ``Emit.USAGE``, is a single adapter-wide flag) and the Hermes plugin API has
+    no per-room config, so this can only ever be one global policy.
     """
     raw = (os.getenv("BAND_EMIT_USAGE") or "").strip().lower()
     if raw in _SCOPES:
         return raw
-    # Accept the usual boolean spellings so "false" does the obvious thing.
-    if raw in {"0", "false", "no", "none"}:
-        return SCOPE_OFF
-    return SCOPE_ALL
+    # Accept the usual boolean spellings so "true"/"false" do the obvious thing.
+    if raw in {"1", "true", "yes", "on"}:
+        return SCOPE_ALL
+    # Anything else — unset, or a typo that must not silently start emitting.
+    return SCOPE_OFF
 
 
 def _platform_value(value: Any) -> str:
@@ -421,15 +441,19 @@ def register_hooks(ctx: Any) -> bool:
     """Wire the usage hooks. Returns whether they were registered.
 
     Skipped when the SDK predates the usage contract, when the host is too old
-    to have ``register_hook``, or when the operator turned usage off — the last
-    one matters because registering ``post_api_request`` makes the host build a
-    sanitized response payload for every API call it would otherwise skip.
+    to have ``register_hook``, or when the scope is ``off`` — which is the
+    DEFAULT (see ``_scope()``), so the normal state of this plugin is to
+    register nothing.  That matters: ``post_api_request`` makes the host build
+    a sanitized response payload for every API call it would otherwise skip, and
+    no one should pay that for a feature they did not opt into.
     """
     if not USAGE_SDK_AVAILABLE:
         logger.debug("[band] usage events disabled: SDK has no usage contract")
         return False
     if _scope() == SCOPE_OFF:
-        logger.debug("[band] usage events disabled by BAND_EMIT_USAGE")
+        logger.debug(
+            "[band] usage events off (default); set BAND_EMIT_USAGE=all to enable"
+        )
         return False
     register = getattr(ctx, "register_hook", None)
     if not callable(register):

@@ -68,6 +68,6 @@ optional_env:
     prompt: "Per-user group sessions? (true/false, default false)"
     password: false
   - name: BAND_EMIT_USAGE
-    description: "Where per-turn token-usage events are posted: 'all' (default) the room the turn ran in, 'hub' only the owner's private control room, 'off' never (also skips registering the host's per-API-call hook). Band has no per-room event-visibility control, so this is one global policy."
-    prompt: "Emit usage events? (all/hub/off, default all)"
+    description: "Where per-turn token-usage events are posted: 'off' (default) never — also skips registering the host's per-API-call hook; 'all' the room the turn ran in; 'hub' only the owner's private control room. Off by default because nothing reads these events yet — they follow the SDK's usage contract, but with no consumer their only visible effect is a 'Task' chip in the room transcript. Band has no per-room event-visibility control, so this is one global policy."
+    prompt: "Emit usage events? (off/all/hub, default off)"
     password: false
