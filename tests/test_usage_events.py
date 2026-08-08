@@ -7,6 +7,7 @@ by ``tests/conftest.py`` at collection time, BEFORE this module imports
 """
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -604,15 +605,24 @@ class TestRegistration:
         assert ue.register_hooks(ctx) is False
         assert registered == {}
 
-    def test_plugin_registration_wires_no_hooks_by_default(self, monkeypatch):
-        """Through the real plugin entry point, not just register_hooks()."""
+    def test_plugin_registration_wires_no_usage_hooks_by_default(self, monkeypatch):
+        """Through the real plugin entry point, not just register_hooks().
+
+        Asserts about the USAGE hooks specifically, not that the plugin registers
+        no hooks at all: execution events register ``pre_tool_call`` /
+        ``post_tool_call`` unconditionally, so a blanket ``assert_not_called``
+        passes on this module's own branch and fails the moment the two slices
+        are composed. Assert only about your own slice's effects.
+        """
         monkeypatch.setenv("BAND_AGENT_ID", "a")
         monkeypatch.setenv("BAND_API_KEY", "k")
         ctx = MagicMock()
 
         _band_mod.register(ctx)
 
-        ctx.register_hook.assert_not_called()
+        wired = {call.args[0] for call in ctx.register_hook.call_args_list if call.args}
+        assert "post_api_request" not in wired
+        assert "post_llm_call" not in wired
 
     def test_older_host_without_register_hook(self, emit_all):
         assert ue.register_hooks(SimpleNamespace()) is False
@@ -657,3 +667,112 @@ class TestNoSelfFeedback:
 
         assert _band_mod._seedable_text(usage_item, []) is None
         assert _band_mod._seedable_text(text_item, []) is not None
+
+
+# ---------------------------------------------------------------------------
+# 9. Observability
+#
+# Usage is the quietest of the three event paths: it fires once per turn and
+# has a dozen legitimate reasons to produce nothing. Each of them has to be
+# distinguishable from a broken one, or "no usage events in this room" is
+# unanswerable.
+# ---------------------------------------------------------------------------
+
+_UE_LOGGER = "hermes_band_platform.usage_events"
+
+
+class TestUsageLogging:
+
+    def _bucket(self, **kwargs):
+        from band.core.types import TurnUsage
+
+        bucket = ue._Bucket(**kwargs)
+        bucket.usage = TurnUsage(input_tokens=1200, output_tokens=340)
+        return bucket
+
+    @pytest.mark.asyncio
+    async def test_emission_is_traceable_at_debug(self, caplog):
+        adapter = _FakeAdapter()
+        with caplog.at_level(logging.DEBUG, logger=_UE_LOGGER):
+            await ue._emit(adapter, "room-a", self._bucket(api_calls=13))
+
+        emitted = [r for r in caplog.records if "Emitted usage event" in r.getMessage()]
+        assert len(emitted) == 1
+        assert emitted[0].levelno == logging.DEBUG
+        message = emitted[0].getMessage()
+        assert "room-a" in message
+        assert "13 API call(s)" in message
+
+    @pytest.mark.asyncio
+    async def test_failed_post_warns_with_the_room(self, caplog):
+        adapter = _FakeAdapter()
+        adapter._link.rest.agent_api_events.create_agent_chat_event = AsyncMock(
+            side_effect=RuntimeError("502 Bad Gateway")
+        )
+        with caplog.at_level(logging.DEBUG, logger=_UE_LOGGER):
+            await ue._emit(adapter, "room-a", self._bucket(api_calls=1))
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "room-a" in warnings[0].getMessage()
+        assert "502 Bad Gateway" in warnings[0].getMessage()
+
+    def test_non_band_turn_is_logged_as_filtered(self, caplog, monkeypatch, emit_all):
+        """No adapter owns the session: a CLI turn, not a broken resolution.
+
+        Needs ``emit_all``: emission is off by default now, and the off path
+        short-circuits before the room resolution this asserts on.
+        """
+        _scheduled(monkeypatch)
+        ue.on_post_api_request(**_api_call())
+        with caplog.at_level(logging.DEBUG, logger=_UE_LOGGER):
+            ue.on_post_llm_call(**_turn_end())
+
+        assert any(
+            "not a Band turn" in r.getMessage() and r.levelno == logging.DEBUG
+            for r in caplog.records
+        )
+
+    def test_hub_scope_suppression_says_it_was_a_policy_choice(
+        self, caplog, monkeypatch
+    ):
+        monkeypatch.setenv("BAND_EMIT_USAGE", "hub")
+        adapter = _FakeAdapter(
+            rooms=("room-group",), session_map={"room-group": "sid-1"},
+            hub_room_id="room-hub",
+        )
+        ue.track_adapter(adapter)
+        calls = _scheduled(monkeypatch)
+
+        ue.on_post_api_request(**_api_call())
+        with caplog.at_level(logging.DEBUG, logger=_UE_LOGGER):
+            ue.on_post_llm_call(**_turn_end())
+
+        assert calls == []
+        assert any("BAND_EMIT_USAGE=hub" in r.getMessage() for r in caplog.records)
+
+    def test_a_turn_that_reported_no_tokens_says_so(self, caplog, monkeypatch):
+        _scheduled(monkeypatch)
+        ue.on_post_api_request(**_api_call(usage=None))
+        with caplog.at_level(logging.DEBUG, logger=_UE_LOGGER):
+            ue.on_post_llm_call(**_turn_end())
+
+        assert any(
+            "no accumulated usage" in r.getMessage() for r in caplog.records
+        )
+
+    def test_the_per_call_platform_filter_stays_silent(self, caplog):
+        """It fires on every API call of every platform — a tight loop."""
+        with caplog.at_level(logging.DEBUG, logger=_UE_LOGGER):
+            for _ in range(20):
+                ue.on_post_api_request(**_api_call(platform="telegram"))
+        assert caplog.records == []
+
+    @pytest.mark.asyncio
+    async def test_no_link_is_logged_before_the_event_is_dropped(self, caplog):
+        adapter = _FakeAdapter()
+        adapter._link = None
+        with caplog.at_level(logging.DEBUG, logger=_UE_LOGGER):
+            await ue._emit(adapter, "room-a", self._bucket(api_calls=1))
+
+        assert any("no live link" in r.getMessage() for r in caplog.records)

@@ -47,6 +47,18 @@ missing SDK must never affect the turn.  Events are exempt from Band's
 @mention requirement, so no mentions are ever attached.  Emitted events cannot
 feed the agent its own telemetry — ``adapter._seedable_text`` drops every
 context item whose ``message_type`` is not ``text`` before rehydration.
+
+Logging
+-------
+Every reason a turn produces no usage event is stated at ``debug`` — "no usage
+reported", "not a Band room", "suppressed by BAND_EMIT_USAGE" and a broken
+resolution all look identical from the outside otherwise.  A failed POST is
+``warning``.  The one path that stays silent on purpose is the platform filter
+in ``on_post_api_request``: it fires on every API call of every platform, and
+a log there would be pure noise.
+
+Nothing logged here is payload — token counts, call counts, model names, room
+ids.  The hooks never see message or tool content in the first place.
 """
 
 from __future__ import annotations
@@ -228,15 +240,22 @@ def _prune_locked(now: float) -> None:
 def on_post_api_request(**kwargs: Any) -> None:
     """Accumulate one API call's tokens into its turn's bucket."""
     if _platform_value(kwargs.get("platform")) != PLATFORM_NAME:
+        # Deliberately silent: this fires on every API call of every platform
+        # the gateway runs, and is the definition of a tight loop.
         return
     key = _turn_key(kwargs)
     if key is None:
+        logger.debug("[band] usage: API call carried no session id — not counted")
         return
     usage = kwargs.get("usage")
     if not isinstance(usage, dict):
         # No usage reported (streaming provider that omits it, an error path).
         # Recording a zero call would understate nothing but inflate the call
         # count, so skip it entirely.
+        logger.debug(
+            "[band] usage: API call reported no usage (%s) — not counted",
+            type(usage).__name__,
+        )
         return
 
     # CanonicalUsage already excludes cache tokens from ``input_tokens`` on
@@ -270,18 +289,27 @@ def on_post_llm_call(**kwargs: Any) -> None:
     """Flush a completed turn's accumulated usage as one Band event."""
     key = _turn_key(kwargs)
     if key is None:
+        logger.debug("[band] usage: turn end carried no session id — nothing to flush")
         return
     with _PENDING_LOCK:
         bucket = _PENDING.pop(key, None)
     if bucket is None:
+        # Routine for a non-Band turn (nothing was ever accumulated) and for a
+        # turn whose bucket was pruned; both are normal, hence debug.
+        logger.debug("[band] usage: no accumulated usage for this turn — no event")
         return
     # An all-zero total means nothing was actually reported; emitting it would
     # look like a real measurement of zero spend (the SDK skips it too).
     if bucket.usage.is_empty:
+        logger.debug(
+            "[band] usage: turn totalled zero tokens over %d API call(s) — no event",
+            bucket.api_calls,
+        )
         return
 
     scope = _scope()
     if scope == SCOPE_OFF:
+        logger.debug("[band] usage: suppressed by BAND_EMIT_USAGE=off")
         return
 
     session_id = key[0]
@@ -290,9 +318,21 @@ def on_post_llm_call(**kwargs: Any) -> None:
         if not room_id:
             continue
         if scope == SCOPE_HUB and room_id != getattr(adapter, "_hub_room_id", None):
+            logger.debug(
+                "[band] usage: room %s is not the hub — suppressed by "
+                "BAND_EMIT_USAGE=hub",
+                room_id,
+            )
             return
         _schedule_emit(adapter, room_id, bucket)
         return
+    # Correctly filtered, not broken: the turn ran on the CLI or another
+    # platform, so no Band adapter owns its session.
+    logger.debug(
+        "[band] usage: session maps to no Band room across %d adapter(s) — "
+        "not a Band turn",
+        len(_adapters()),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +356,12 @@ def _room_for_session(adapter: Any, session_id: str) -> Optional[str]:
     """
     store = getattr(adapter, "_session_store", None)
     if not store or not session_id:
+        logger.debug(
+            "[band] usage: cannot resolve a room (session store present=%s, "
+            "session id present=%s)",
+            bool(store),
+            bool(session_id),
+        )
         return None
     try:
         ensure = getattr(store, "_ensure_loaded", None)
@@ -398,10 +444,16 @@ def _schedule_emit(adapter: Any, room_id: str, bucket: _Bucket) -> bool:
     """
     link_loop = getattr(adapter, "_link_loop", None)
     if link_loop is None or not link_loop.is_running():
+        logger.debug(
+            "[band] usage: dropping event for room %s — link loop absent or stopped",
+            room_id,
+        )
         return False
     try:
         running = asyncio.get_running_loop()
     except RuntimeError:
+        # Not an error and not swallowed: "no running loop" is the answer this
+        # asks for — the hooks fire on the agent's thread. Nothing to report.
         running = None
     coro = _emit(adapter, room_id, bucket)
     if running is link_loop:
@@ -415,9 +467,13 @@ async def _emit(adapter: Any, room_id: str, bucket: _Bucket) -> None:
     """Post the usage event. Swallows every failure by design."""
     link = getattr(adapter, "_link", None)
     if link is None:
+        logger.debug(
+            "[band] usage: dropping event for room %s — adapter has no live link",
+            room_id,
+        )
         return
     try:
-        await link.rest.agent_api_events.create_agent_chat_event(
+        resp = await link.rest.agent_api_events.create_agent_chat_event(
             chat_id=room_id,
             event=ChatEventRequest(
                 content=build_content(bucket),
@@ -428,8 +484,18 @@ async def _emit(adapter: Any, room_id: str, bucket: _Bucket) -> None:
             ),
             request_options=DEFAULT_REQUEST_OPTIONS,
         )
+        # Counts only — the hooks never carry message or tool content.
+        logger.debug(
+            "[band] Emitted usage event to room %s (event id %s, %d API call(s), "
+            "%d in / %d out)",
+            room_id,
+            getattr(getattr(resp, "data", None), "id", None),
+            bucket.api_calls,
+            bucket.usage.input_tokens,
+            bucket.usage.output_tokens,
+        )
     except Exception as e:
-        logger.debug("[band] usage event failed for room %s: %s", room_id, e)
+        logger.warning("[band] Usage event failed for room %s: %s", room_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -457,7 +523,9 @@ def register_hooks(ctx: Any) -> bool:
         return False
     register = getattr(ctx, "register_hook", None)
     if not callable(register):
+        logger.debug("[band] usage events off: host has no ctx.register_hook")
         return False
     register("post_api_request", on_post_api_request)
     register("post_llm_call", on_post_llm_call)
+    logger.debug("[band] usage events on (post_api_request/post_llm_call)")
     return True
