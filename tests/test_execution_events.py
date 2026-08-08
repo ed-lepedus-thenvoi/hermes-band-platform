@@ -8,13 +8,17 @@ they never re-enter the agent's own context.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from hermes_band_platform import execution_events as ee
+from hermes_band_platform.adapter import _short_id
 
 
 ROOM = "11111111-1111-1111-1111-111111111111"
@@ -190,7 +194,10 @@ class TestSizeAndBlankContent:
     def test_blank_serialized_content_falls_back_to_the_placeholder(self, monkeypatch):
         """The SDK's own last-resort guard, reproduced: never post empty content."""
         monkeypatch.setattr(ee, "json", SimpleNamespace(dumps=lambda *a, **kw: ""))
-        assert ee._event_content({"a": 1}) == ee._EVENT_EMPTY_CONTENT_PLACEHOLDER
+        content = ee._event_content(
+            {"a": 1}, message_type=ee._TOOL_CALL, room_id=ROOM
+        )
+        assert content == ee._EVENT_EMPTY_CONTENT_PLACEHOLDER
 
 
 # ---------------------------------------------------------------------------
@@ -520,3 +527,223 @@ class TestEventsStayOutOfContext:
         # An event authored by another agent still must not wake this one.
         adapter._agent_id = "someone-else"
         assert await adapter._handle_message_created(SimpleNamespace()) is False
+
+
+# ---------------------------------------------------------------------------
+# Observability
+#
+# These paths are best-effort by design, and best-effort plus silence is how a
+# failed emission stays invisible forever. Every outcome must be greppable —
+# and none of it may carry payload, since tool args and tool output are exactly
+# where credentials live.
+# ---------------------------------------------------------------------------
+
+_EE_LOGGER = "hermes_band_platform.execution_events"
+
+# Distinctive enough that any accidental echo of tool args or output into a log
+# line is unmistakable, and not a pattern the host redactor would mask.
+SECRET_ARG = "correct-horse-battery-staple-9d2f"
+
+# Names that hold payload — tool args, tool output, a serialized event body.
+# Any of them reaching a ``logger.*`` argument is a leak.
+_PAYLOAD_NAMES = {"args", "output", "payload", "content", "result", "safe"}
+
+
+def _payload_names_in_log_args(module) -> list:
+    """``[(lineno, name), ...]`` for payload values passed to ``logger.*``.
+
+    ``len(x)`` and ``type(x)`` are skipped wholesale: a size and a type name
+    are exactly what these log sites are supposed to report in place of the
+    value.
+    """
+    def _walk(node):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            if isinstance(fn, ast.Name) and fn.id in {"len", "type"}:
+                return
+        if isinstance(node, ast.Name) and node.id in _PAYLOAD_NAMES:
+            yield node
+        for child in ast.iter_child_nodes(node):
+            yield from _walk(child)
+
+    offenders = []
+    for node in ast.walk(ast.parse(inspect.getsource(module))):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "logger"
+        ):
+            continue
+        for arg in node.args[1:]:  # arg 0 is the format string itself
+            offenders += [(found.lineno, found.id) for found in _walk(arg)]
+    return offenders
+
+
+class TestEmissionLogging:
+    async def test_successful_emission_is_traceable_at_debug(self, caplog):
+        adapter = _make_adapter()
+        with caplog.at_level(logging.DEBUG, logger=_EE_LOGGER):
+            assert await ee.emit_event(
+                adapter,
+                ee._TOOL_CALL,
+                SESSION,
+                {ee._K_NAME: "terminal", ee._K_ARGS: {"command": "ls"}},
+            ) is True
+
+        emitted = [r for r in caplog.records if "Emitted" in r.getMessage()]
+        assert len(emitted) == 1
+        assert emitted[0].levelno == logging.DEBUG
+        message = emitted[0].getMessage()
+        # message_type, room and tool are what a grep starts from.
+        assert "tool_call" in message
+        assert _short_id(ROOM) in message
+        assert "terminal" in message
+
+    async def test_failed_post_logs_a_warning_naming_the_room(self, caplog):
+        adapter = _make_adapter()
+        adapter._link.rest.agent_api_events.create_agent_chat_event = AsyncMock(
+            side_effect=RuntimeError("502 Bad Gateway")
+        )
+        with caplog.at_level(logging.DEBUG, logger=_EE_LOGGER):
+            assert await ee.emit_event(
+                adapter, ee._TOOL_CALL, SESSION, {ee._K_NAME: "terminal"}
+            ) is False
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert _short_id(ROOM) in message
+        assert "tool_call" in message
+        assert "502 Bad Gateway" in message
+
+    async def test_fail_closed_drop_is_loud_and_says_why(self, caplog, monkeypatch):
+        import agent.redact
+
+        def _boom(text, force=False):
+            raise RuntimeError("redactor gone")
+
+        monkeypatch.setattr(agent.redact, "redact_sensitive_text", _boom)
+
+        adapter = _make_adapter()
+        with caplog.at_level(logging.DEBUG, logger=_EE_LOGGER):
+            assert await ee.emit_event(
+                adapter, ee._TOOL_CALL, SESSION, {ee._K_NAME: "terminal"}
+            ) is False
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        # An event silently dropped is data the room never gets: say so, say
+        # which room, and say why.
+        assert "redaction unavailable" in message
+        assert _short_id(ROOM) in message
+        assert "tool_call" in message
+
+    async def test_non_band_turn_is_logged_as_filtered_not_broken(self, caplog):
+        """A CLI or Telegram turn resolves to no room — the normal outcome."""
+        adapter = _make_adapter()
+        with caplog.at_level(logging.DEBUG, logger=_EE_LOGGER):
+            assert await ee.emit_event(
+                adapter, ee._TOOL_CALL, "some-other-session", {ee._K_NAME: "terminal"}
+            ) is False
+
+        skipped = [r for r in caplog.records if "no execution event" in r.getMessage()]
+        assert len(skipped) == 1
+        assert skipped[0].levelno == logging.DEBUG
+        # The wording, not just the fact, is the point: this must not read the
+        # same as a resolution that broke.
+        assert "not a Band room" not in skipped[0].getMessage()
+        assert "maps to no Band room" in skipped[0].getMessage()
+        assert "CLI or" in skipped[0].getMessage()
+
+    async def test_broken_resolution_reads_differently_from_a_filtered_turn(
+        self, caplog
+    ):
+        adapter = _make_adapter()
+        adapter._session_store = None
+        with caplog.at_level(logging.DEBUG, logger=_EE_LOGGER):
+            assert await ee.emit_event(
+                adapter, ee._TOOL_CALL, SESSION, {ee._K_NAME: "terminal"}
+            ) is False
+
+        skipped = [r for r in caplog.records if "no execution event" in r.getMessage()]
+        assert len(skipped) == 1
+        assert "session store" in skipped[0].getMessage()
+
+    async def test_missing_link_says_so(self, caplog):
+        adapter = _make_adapter()
+        adapter._link = None
+        with caplog.at_level(logging.DEBUG, logger=_EE_LOGGER):
+            await ee.emit_event(adapter, ee._TOOL_CALL, SESSION, {ee._K_NAME: "t"})
+        assert any("no live link" in r.getMessage() for r in caplog.records)
+
+
+class TestLogsNeverCarryPayload:
+    """The constraint most likely to regress, pinned on every logging path.
+
+    Tool args and tool output are the single most credential-dense thing this
+    plugin touches — it is why redaction here is fail-closed. A log line that
+    leaks one is worse than the silence it replaced.
+    """
+
+    @staticmethod
+    def _payload():
+        return {
+            ee._K_NAME: "terminal",
+            ee._K_ARGS: {"command": f"deploy --token {SECRET_ARG}"},
+            ee._K_OUTPUT: f"connected as {SECRET_ARG}",
+            ee._K_TOOL_CALL_ID: "call_1",
+        }
+
+    async def test_successful_emission_logs_no_payload(self, caplog):
+        adapter = _make_adapter()
+        with caplog.at_level(logging.DEBUG, logger=_EE_LOGGER):
+            assert await ee.emit_event(
+                adapter, ee._TOOL_CALL, SESSION, self._payload()
+            ) is True
+        assert caplog.records  # not vacuously true
+        assert SECRET_ARG not in caplog.text
+
+    async def test_failed_post_logs_no_payload(self, caplog):
+        adapter = _make_adapter()
+        adapter._link.rest.agent_api_events.create_agent_chat_event = AsyncMock(
+            side_effect=RuntimeError("502 Bad Gateway")
+        )
+        with caplog.at_level(logging.DEBUG, logger=_EE_LOGGER):
+            await ee.emit_event(adapter, ee._TOOL_CALL, SESSION, self._payload())
+        assert caplog.records
+        assert SECRET_ARG not in caplog.text
+
+    async def test_fail_closed_drop_logs_no_payload(self, caplog, monkeypatch):
+        """The strongest case: here the payload has NOT been redacted yet.
+
+        The redactor is the one frame holding raw tool args, so its exception is
+        the likeliest way that text reaches a log — which is why only the
+        exception *type* is recorded.
+        """
+        import agent.redact
+
+        secret = SECRET_ARG
+
+        def _boom(text, force=False):
+            raise RuntimeError(f"failed while scrubbing: {secret}")
+
+        monkeypatch.setattr(agent.redact, "redact_sensitive_text", _boom)
+
+        adapter = _make_adapter()
+        with caplog.at_level(logging.DEBUG, logger=_EE_LOGGER):
+            await ee.emit_event(adapter, ee._TOOL_CALL, SESSION, self._payload())
+        assert caplog.records
+        assert SECRET_ARG not in caplog.text
+
+    def test_no_logging_call_in_the_module_formats_args_or_output(self):
+        """Structural backstop: no log site may interpolate a payload value.
+
+        A behavioural test only covers the paths it exercises; this one covers
+        the log lines added later, by anyone. A payload may be *sized* —
+        ``len(content)`` is explicitly fine — but never passed as a value.
+        """
+        assert _payload_names_in_log_args(ee) == []

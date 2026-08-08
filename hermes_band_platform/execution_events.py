@@ -49,6 +49,20 @@ failing REST call must never break the tool or the reply.
 
 Events carry no mentions (the API exempts them from the >=1 mention rule that
 messages are held to), so however many are emitted, nobody is pinged.
+
+Logging
+-------
+Every path out of this module says so: a successful post at ``debug`` (the
+grep that answers "did that emit"), a failed post or a dropped event at
+``warning`` (an operator would otherwise never learn the room lost data), and
+the routine "this turn isn't a Band turn" filter at ``debug``, worded so it is
+distinguishable from a *broken* room resolution.
+
+NOTHING logs payload content. Tool args and tool output are exactly where
+credentials live — the reason redaction here is fail-closed — so log sites
+carry ids, types, counts and lengths only. On the pre-redaction path
+(``_redact_payload``) even the exception *message* is withheld, since the
+redactor is the one thing holding raw payload at the moment it raises.
 """
 
 from __future__ import annotations
@@ -60,9 +74,10 @@ from typing import Any, Dict, Optional
 
 from gateway.config import Platform
 
-# Reuse the adapter's REST defaults. Importing the adapter module is safe even
-# when the SDK is absent (it guards its own import).
-from .adapter import DEFAULT_REQUEST_OPTIONS
+# Reuse the adapter's REST defaults and its id-shortening log helper. Importing
+# the adapter module is safe even when the SDK is absent (it guards its own
+# import).
+from .adapter import DEFAULT_REQUEST_OPTIONS, _short_id
 
 logger = logging.getLogger(__name__)
 
@@ -132,11 +147,12 @@ def _load_sdk() -> bool:
         from ._band_libs import prepend_band_libs
 
         prepend_band_libs()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("[band] execution events: band-libs shim unusable: %s", e)
     try:
         from band.client.rest import ChatEventRequest as _ChatEventRequest
-    except ImportError:
+    except ImportError as e:
+        logger.debug("[band] execution events off: band-sdk not importable: %s", e)
         return False
     ChatEventRequest = _ChatEventRequest
     return True
@@ -182,7 +198,9 @@ def _redact_tree(value: Any, scrub) -> Any:
     return scrub(str(value))
 
 
-def _redact_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _redact_payload(
+    payload: Dict[str, Any], *, message_type: str, room_id: str
+) -> Optional[Dict[str, Any]]:
     """Scrub credentials from an event payload, or None if that cannot be done.
 
     Delegates to ``agent.redact.redact_sensitive_text`` — the host's own
@@ -197,6 +215,12 @@ def _redact_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     ``process``) rather than universally. So this pass is load-bearing, not
     belt-and-braces — hence fail-*closed*: a Band event cannot be deleted once
     written, so an unavailable redactor drops the event instead of emitting raw.
+
+    The drop is logged at ``warning``: a silently discarded event is data the
+    room never gets and nobody would otherwise discover. Only the exception
+    *type* is logged, never its message — this is the one call site holding
+    unredacted tool args / output, so a raised exception is the most plausible
+    way raw payload could reach a log file.
     """
     try:
         from agent.redact import redact_sensitive_text
@@ -204,19 +228,34 @@ def _redact_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return _redact_tree(
             payload, lambda text: redact_sensitive_text(text, force=True)
         )
-    except Exception:
+    except Exception as e:
         logger.warning(
-            "[band] execution event dropped — secret redaction unavailable"
+            "[band] Dropping %s event for room %s — secret redaction unavailable "
+            "(%s); fail-closed, nothing was emitted",
+            message_type,
+            _short_id(room_id),
+            type(e).__name__,
         )
         return None
 
 
-def _event_content(payload: Dict[str, Any]) -> Optional[str]:
+def _event_content(
+    payload: Dict[str, Any], *, message_type: str, room_id: str
+) -> Optional[str]:
     """Serialize an already-redacted payload, placeholder it, and truncate."""
     try:
         content = json.dumps(payload, ensure_ascii=False, default=str)
-    except Exception:
-        logger.debug("[band] execution event payload not serializable")
+    except Exception as e:
+        # ``default=str`` makes this near-unreachable, so reaching it means the
+        # payload shape is wrong, not that a value was awkward — hence warning.
+        # The payload is already redacted here and json.dumps errors name types,
+        # not values, so the exception is safe to log.
+        logger.warning(
+            "[band] Dropping %s event for room %s — payload not serializable: %s",
+            message_type,
+            _short_id(room_id),
+            e,
+        )
         return None
     if not content:
         content = _EVENT_EMPTY_CONTENT_PLACEHOLDER
@@ -234,7 +273,16 @@ def _output_text(result: Any) -> str:
     if not isinstance(result, str):
         try:
             result = json.dumps(result, ensure_ascii=False, default=str)
-        except Exception:
+        except Exception as e:
+            # A degradation, not a failure — the output still goes out, just
+            # rendered by ``str``. Types only: this is raw, pre-redaction tool
+            # output, so nothing about its *value* may be recorded.
+            logger.debug(
+                "[band] tool result of type %s is not JSON-serializable (%s); "
+                "falling back to str()",
+                type(result).__name__,
+                type(e).__name__,
+            )
             result = str(result)
     return result or _EVENT_EMPTY_CONTENT_PLACEHOLDER
 
@@ -245,8 +293,12 @@ def _live_adapter() -> Optional[Any]:
         from gateway.run import _gateway_runner_ref
 
         runner = _gateway_runner_ref()
-        return runner.adapters.get(Platform("band")) if runner else None
-    except Exception:
+        if runner is None:
+            logger.debug("[band] execution event skipped — no live gateway runner")
+            return None
+        return runner.adapters.get(Platform("band"))
+    except Exception as e:
+        logger.debug("[band] execution event skipped — no live Band adapter: %s", e)
         return None
 
 
@@ -257,8 +309,14 @@ def _room_for_session(adapter: Any, session_id: str) -> Optional[str]:
     CLI turn from writing events into a Band room: the session store maps each
     room's session key to a session id, and a session id we don't recognise
     isn't ours. Read-only and never raises.
+
+    Every ``None`` says *why* at ``debug``, because "no room" is both the
+    normal outcome for a non-Band turn and what a broken resolution looks like,
+    and an operator staring at a room with no events needs to tell those apart.
+    Debug, not info: this runs on every tool call of every platform.
     """
     if not session_id:
+        logger.debug("[band] no execution event: hook fired without a session id")
         return None
     cached = _SESSION_ROOM_CACHE.get(session_id)
     if cached is not None:
@@ -267,11 +325,20 @@ def _room_for_session(adapter: Any, session_id: str) -> Optional[str]:
     store = getattr(adapter, "_session_store", None)
     session_key_for = getattr(adapter, "_session_key_for", None)
     if store is None or session_key_for is None:
+        # Structurally wrong rather than filtered — a connected BandAdapter
+        # always has both. Debug all the same: it repeats per tool call.
+        logger.debug(
+            "[band] no execution event: adapter exposes no session store/key "
+            "(store=%s, key_fn=%s)",
+            store is not None,
+            session_key_for is not None,
+        )
         return None
     try:
         store._ensure_loaded()
         entries = store._entries
-    except Exception:
+    except Exception as e:
+        logger.debug("[band] no execution event: session store unreadable: %s", e)
         return None
 
     rooms = set(getattr(adapter, "_known_rooms", None) or ())
@@ -283,13 +350,24 @@ def _room_for_session(adapter: Any, session_id: str) -> Optional[str]:
         try:
             key = session_key_for(room_id)
             entry = entries.get(key) if key else None
-        except Exception:
+        except Exception as e:
+            logger.debug(
+                "[band] execution event: session key lookup failed for room %s: %s",
+                _short_id(room_id),
+                e,
+            )
             continue
         if entry is not None and getattr(entry, "session_id", None) == session_id:
             if len(_SESSION_ROOM_CACHE) >= _SESSION_ROOM_CACHE_MAX:
                 _SESSION_ROOM_CACHE.clear()
             _SESSION_ROOM_CACHE[session_id] = room_id
             return room_id
+    logger.debug(
+        "[band] no execution event: session %s maps to no Band room — a CLI or "
+        "Telegram turn (searched %d room(s))",
+        _short_id(session_id),
+        len(rooms),
+    )
     return None
 
 
@@ -303,19 +381,37 @@ async def emit_event(
     full ToolEventKey payload lives in ``content`` under the single documented
     size cap, which is the shape the band SDK's own adapters emit and its
     ``band.converters.parsing`` reads back.
+
+    Every return is logged: the skips by the helper that decided them, the post
+    itself at ``debug`` (message_type, room, resulting event id, content size)
+    and a failed post at ``warning``. Sizes and ids only — never content.
     """
+    room_id: Optional[str] = None
     try:
         room_id = _room_for_session(adapter, session_id)
         if room_id is None:
+            # _room_for_session has already logged which case this was.
             return False
-        safe = _redact_payload(payload)
+        safe = _redact_payload(payload, message_type=message_type, room_id=room_id)
         if safe is None:
             return False
-        content = _event_content(safe)
+        content = _event_content(safe, message_type=message_type, room_id=room_id)
         if content is None:
             return False
         link = getattr(adapter, "_link", None)
-        if link is None or not _load_sdk():
+        if link is None:
+            logger.debug(
+                "[band] %s event for room %s not emitted — adapter has no live link",
+                message_type,
+                _short_id(room_id),
+            )
+            return False
+        if not _load_sdk():
+            logger.debug(
+                "[band] %s event for room %s not emitted — band-sdk unavailable",
+                message_type,
+                _short_id(room_id),
+            )
             return False
 
         # Built from the redacted payload, so metadata can never carry a value
@@ -329,7 +425,7 @@ async def emit_event(
         # No mentions: the events endpoint is exempt from the >=1 mention rule
         # that create_agent_chat_message enforces, so emitting these can never
         # ping a participant however many tools a turn runs.
-        await link.rest.agent_api_events.create_agent_chat_event(
+        resp = await link.rest.agent_api_events.create_agent_chat_event(
             chat_id=room_id,
             event=ChatEventRequest(
                 content=content,
@@ -338,10 +434,26 @@ async def emit_event(
             ),
             request_options=DEFAULT_REQUEST_OPTIONS,
         )
+        # The one line that answers "did that emit?". Content is reported as a
+        # length; the tool name is a registry identifier, not payload.
+        logger.debug(
+            "[band] Emitted %s event for tool %r to room %s (event id %s, %d chars)",
+            message_type,
+            metadata.get(_K_NAME) or "<unnamed>",
+            _short_id(room_id),
+            _short_id(getattr(getattr(resp, "data", None), "id", None)),
+            len(content),
+        )
         return True
     except Exception as e:
-        logger.debug(
-            "[band] execution event (%s) dropped: %s", message_type, e
+        # Warning, not debug: the room silently loses this event, and the POST
+        # runs on already-redacted content, so the error text cannot carry raw
+        # tool args or output.
+        logger.warning(
+            "[band] Failed to emit %s event to room %s: %s",
+            message_type,
+            _short_id(room_id),
+            e,
         )
         return False
 
@@ -357,9 +469,14 @@ def _schedule(message_type: str, session_id: str, payload: Dict[str, Any]) -> No
     try:
         adapter = _live_adapter()
         if adapter is None:
+            # _live_adapter has already logged why.
             return
         loop = getattr(adapter, "_link_loop", None)
         if loop is None or not loop.is_running():
+            logger.debug(
+                "[band] %s event not scheduled — link loop absent or stopped",
+                message_type,
+            )
             return
         asyncio.run_coroutine_threadsafe(
             emit_event(adapter, message_type, session_id, payload), loop
@@ -387,6 +504,7 @@ def on_pre_tool_call(
 ) -> None:
     """``pre_tool_call`` observer — emit a ``tool_call`` event."""
     if not tool_name:
+        logger.debug("[band] pre_tool_call hook carried no tool name — no event")
         return None
     _schedule(
         _TOOL_CALL,
@@ -417,6 +535,7 @@ def on_post_tool_call(
     a failed operation worked.
     """
     if not tool_name:
+        logger.debug("[band] post_tool_call hook carried no tool name — no event")
         return None
     _schedule(
         _TOOL_RESULT,
@@ -436,12 +555,18 @@ def register_hooks(ctx) -> None:
     try:
         ctx.register_hook("pre_tool_call", on_pre_tool_call)
         ctx.register_hook("post_tool_call", on_post_tool_call)
+        logger.debug("[band] execution events on (pre_tool_call/post_tool_call)")
     except AttributeError:
         # Older host without ctx.register_hook — no execution events, but the
-        # platform still registers and works.
+        # platform still registers and works. Expected, so debug.
         logger.debug("[band] host has no ctx.register_hook; execution events off")
     except Exception as e:
-        logger.debug("[band] execution-event hook registration skipped: %s", e)
+        # Anything else means the hooks are off on a host that should support
+        # them: no tool_call/tool_result will EVER appear, for the whole
+        # process. Once per plugin load, so warning costs nothing.
+        logger.warning(
+            "[band] Execution events off — hook registration failed: %s", e
+        )
 
 
 __all__ = [
