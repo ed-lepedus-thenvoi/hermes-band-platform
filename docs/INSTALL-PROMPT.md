@@ -52,6 +52,9 @@ You're connecting this machine's Hermes install to Band for me. Work in the shel
      installs only.
    • Never make me paste a Band *user* API key into a command — I'll set BAND_USER_API_KEY
      for the one registration step, then remove it.
+   • Leave tool execution events off unless I explicitly opt in. BAND_EMIT_EXECUTION=hub exposes
+     redacted args/results only for turns from the private owner hub; =all exposes them to every
+     participant in each originating Band room.
 
 3. Stop and ask me at the two human gates:
    • Credentials — I either create the Band agent at app.band.ai/agents/new and give you

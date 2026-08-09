@@ -179,6 +179,10 @@ re-installs or re-registers what's already in place.
      unset BAND_USER_API_KEY
      ```
      This is **idempotent at the flow level**: step 2 only routes here when `verify_install` reports the credentials missing, so a re-run never mints a second agent. **Do not put `BAND_USER_API_KEY` into the agent's own environment or read it yourself** — let the bootstrapper or a plain shell consume it before/outside the agent, so the user key never reaches the LLM. After `band.cli.register_agent` is published in `band-sdk`, replace this helper call with `"$HERMES_PY" -m band.cli.register_agent` only after confirming the SDK CLI sends the same Cloudflare-safe registration headers. Have the user remove `BAND_USER_API_KEY` afterward.
+   - Tool-call/result events stay private by default (`BAND_EMIT_EXECUTION=off`). Only set
+     `BAND_EMIT_EXECUTION=hub` if the user wants execution visibility in the private owner hub,
+     or `all` after explicitly confirming that every participant in an originating Band room may
+     see the redacted tool args/results. Invalid values fail closed to `off`.
 
 6. Ensure the access policy (skip if `access_policy_allowlist` is already true). Band owns access control, but the gateway only trusts an own-policy adapter's intake when its effective policy is `allowlist` — otherwise it default-denies every sender and the agent replies "not an authorized user". The current plugin sets this on the live adapter in code; this step also records it in config so it holds regardless of plugin version and **can be re-run anytime to repair an already-deployed agent** without a plugin reinstall:
    ```bash

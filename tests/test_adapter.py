@@ -6,6 +6,7 @@ BEFORE this module imports the adapter — so the adapter's top-level
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import sys
 from types import SimpleNamespace
@@ -59,6 +60,23 @@ class TestBandAdapterInit:
         adapter = _make_adapter(monkeypatch, agent_id="env-agent-id", api_key="env-api-key")
         assert adapter._cfg_agent_id == "env-agent-id"
         assert adapter._api_key == "env-api-key"
+
+    def test_execution_emission_defaults_off(self, monkeypatch):
+        monkeypatch.delenv("BAND_EMIT_EXECUTION", raising=False)
+        assert _make_adapter(monkeypatch)._execution_scope == "off"
+
+    def test_blank_execution_emission_scope_is_off(self, monkeypatch):
+        monkeypatch.setenv("BAND_EMIT_EXECUTION", "")
+        assert _make_adapter(monkeypatch)._execution_scope == "off"
+
+    @pytest.mark.parametrize("scope", ["off", "all", "hub"])
+    def test_execution_emission_accepts_documented_scopes(self, monkeypatch, scope):
+        monkeypatch.setenv("BAND_EMIT_EXECUTION", scope)
+        assert _make_adapter(monkeypatch)._execution_scope == scope
+
+    def test_invalid_execution_emission_scope_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("BAND_EMIT_EXECUTION", "yes")
+        assert _make_adapter(monkeypatch)._execution_scope == "off"
 
     def test_init_reads_credentials_from_config_extra(self, monkeypatch):
         for key in ("BAND_AGENT_ID", "BAND_API_KEY", "BAND_BASE_URL", "BAND_OWNER_ID"):
@@ -2431,6 +2449,23 @@ class TestConnectDisconnect:
 
         assert task.cancelled() or task.done()
         assert adapter._room_catch_up_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_pending_execution_emissions(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        pending = concurrent.futures.Future()
+        adapter._execution_pending.add(pending)
+        adapter._execution_accepting = True
+
+        fake_link = MagicMock()
+        fake_link.disconnect = AsyncMock()
+        adapter._link = fake_link
+
+        await adapter.disconnect()
+
+        assert pending.cancelled()
+        assert adapter._execution_pending == set()
+        assert adapter._execution_accepting is False
 
 
 # ---------------------------------------------------------------------------

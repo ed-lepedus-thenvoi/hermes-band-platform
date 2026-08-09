@@ -40,6 +40,10 @@ optional_env:
     description: "Main-channel override: room ID for cron / notification delivery (also set by /sethome from a Band room). Defaults to the hub."
     prompt: "Home room ID (or empty to use the hub)"
     password: false
+  - name: BAND_EMIT_EXECUTION
+    description: "Execution-event visibility: off (default), hub (only turns originating in the private owner hub), or all (every Band room; explicit opt-in because tool args/results are shared with room participants)."
+    prompt: "Emit tool execution events? (off/hub/all; default off)"
+    password: false
   - name: BAND_HUB_FAILOVER_THRESHOLD
     description: "Consecutive failed hub sends before the agent creates a fresh hub room and re-wires it as the main channel (default 3). Recovers when the hub hits its Band message limit or persistently errors; a successful hub send resets the count."
     prompt: "Hub failover threshold (or empty for 3)"

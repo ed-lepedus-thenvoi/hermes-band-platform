@@ -304,6 +304,7 @@ has no DMs, so an un-mentioned message is ignored by design. A reply means you'r
 | `BAND_OWNER_ID` | Owner UUID override. Normally resolved from the agent identity on connect; anchors the hub and the owner-only gates. |
 | `BAND_HUB_ROOM` | Hub room UUID. Auto-created and persisted on first connect; set it to pin an existing room. |
 | `BAND_HOME_ROOM` | Main-channel override for cron / notification delivery (also set by `/sethome` from a Band room). Defaults to the hub. |
+| `BAND_EMIT_EXECUTION` | Publish redacted tool-call and tool-result events: `off` (default), `hub` (only turns originating in the private owner hub), or `all` (every Band room). `all` is an explicit opt-in because room participants can see tool args/results. Invalid values fail closed to `off`. |
 | `BAND_HUB_FAILOVER_THRESHOLD` | Consecutive failed hub sends before failing over to a fresh hub room (default `3`). A successful hub send resets the count. See [Hub failover](#hub-failover). |
 | `BAND_HUB_FAILOVER_MAX_PER_CONNECT` | Backstop cap on hub failovers per gateway connection (default `5`). |
 
@@ -323,6 +324,9 @@ has no DMs, so an un-mentioned message is ignored by design. A reply means you'r
   backstop in addition to the SDK's own filtering.
 - **Outbound**: posts via the REST client, chunking long messages. Each reply @mentions the
   room's last human sender (falling back to all non-agent participants).
+- **Execution events**: disabled by default. Set `BAND_EMIT_EXECUTION=hub` to show redacted tool
+  calls/results only for turns started in the private owner hub, or `all` to publish them in every
+  originating Band room. Events never mention participants; oversized payloads remain valid JSON.
 
 ### The Hub (main channel + command surface)
 

@@ -36,6 +36,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -157,6 +158,11 @@ _OWNER_COMMAND_NOTICE = (
 # may happen (so a platform-wide outage can't spin up rooms without bound).
 _HUB_FAILOVER_THRESHOLD_DEFAULT = 3
 _HUB_FAILOVER_MAX_PER_CONNECT_DEFAULT = 5
+
+# Execution-event REST submissions are created from synchronous Hermes hooks.
+# Keep a small, per-adapter backstop so a slow Band endpoint cannot accumulate
+# unbounded coroutine/future state for a tool-heavy turn.
+_EXECUTION_PENDING_MAX = 64
 
 
 def _int_env(name: str, default: int) -> int:
@@ -511,6 +517,22 @@ class BandAdapter(BasePlatformAdapter):
         # Loop the link's asyncio primitives bind to; a cross-loop send() is
         # marshalled back onto it rather than raising (see _send_on_link).
         self._link_loop: Optional[asyncio.AbstractEventLoop] = None
+        # Futures returned by run_coroutine_threadsafe for execution events.
+        # The lock is required because hook callbacks and future callbacks may
+        # run on different worker/link-loop threads.
+        self._execution_pending: set = set()
+        self._execution_pending_lock = threading.Lock()
+        self._execution_pending_max: int = _EXECUTION_PENDING_MAX
+        self._execution_accepting: bool = False
+        self._execution_scope: str = (
+            (os.getenv("BAND_EMIT_EXECUTION") or "off").strip().lower()
+        )
+        if self._execution_scope not in {"off", "all", "hub"}:
+            logger.warning(
+                "[band] Invalid BAND_EMIT_EXECUTION=%r; execution events are off",
+                self._execution_scope,
+            )
+            self._execution_scope = "off"
         self._consumer_task: Optional[asyncio.Task] = None
         # Background /next catch-up drain (Route A), (re)started on connect.
         self._catch_up_task: Optional[asyncio.Task] = None
@@ -629,6 +651,7 @@ class BandAdapter(BasePlatformAdapter):
             await self._bootstrap_hub_safe()
             self._consumer_task = asyncio.create_task(self._consume())
             self._mark_connected()
+            self._execution_accepting = True
             logger.info(
                 "[band] Connected as agent %s (handle=%s, owner=%s)",
                 _short_id(self._agent_id),
@@ -765,6 +788,12 @@ class BandAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Cancel the consumer, drop the link, release the scoped lock."""
+        # Close the submission gate before taking down the link. Cancellation is
+        # bounded and yields only to let same-loop cancellations settle, so a
+        # slow event POST can never hold gateway shutdown open.
+        from .execution_events import cancel_pending_emissions
+
+        await cancel_pending_emissions(self)
         self._mark_disconnected()
 
         if self._catch_up_task and not self._catch_up_task.done():
