@@ -88,6 +88,7 @@ def test_no_unsafe_sdk_install_guidance_in_package():
 
 
 def test_sdk_install_command_is_target_form():
+    assert _band_libs.BAND_SDK_SPEC == "band-sdk>=1.3.0,<2.0.0"
     cmd = _band_libs.sdk_install_command()
     assert cmd.startswith("uv pip install --python")
     assert f'--target "{_band_libs.band_libs_dir()}"' in cmd

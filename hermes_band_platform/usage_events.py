@@ -14,13 +14,15 @@ The host fires two relevant plugin hooks (``hermes_cli/plugins.py::VALID_HOOKS``
   ``run_agent.py::AIAgent._usage_summary_for_api_request_hook``; the same
   numbers the host logs as ``API call #N: ... in=/out=/total=``
   (``agent/conversation_loop.py``).
-* ``post_llm_call`` — once per *turn*, after the tool-calling loop finishes
-  (``agent/turn_finalizer.py``).  Carries no usage at all.
+* ``post_llm_call`` — once per successful, non-interrupted turn with a final
+  response (``agent/turn_finalizer.py``).  Carries no usage at all.
+* ``BandAdapter.on_processing_complete`` — the terminal path that also sees
+  failed and cancelled turns, plus their originating room event.
 
 So neither hook alone is enough: the per-turn hook has no numbers and the
 hook with numbers fires per call.  We therefore accumulate on
 ``post_api_request`` keyed by ``(session_id, turn_id)`` — both hooks carry the
-same pair — and flush once on ``post_llm_call``.  A single real turn was
+same pair — and atomically pop once from either terminal path.  A single real turn was
 measured making 13 API calls, so per-call emission would be far too noisy for
 a chat room; one event per turn is the unit a room participant can read.
 
@@ -81,22 +83,49 @@ logger = logging.getLogger(__name__)
 # breaking plugin load.  ``USAGE_EVENT_TYPE``/``USAGE_METADATA_KEY`` were added
 # alongside ``TurnUsage``; an older SDK simply has no usage contract to follow.
 # ---------------------------------------------------------------------------
-try:
-    from band.client.rest import ChatEventRequest, DEFAULT_REQUEST_OPTIONS
-    from band.core.types import (
-        USAGE_EVENT_TYPE,
-        USAGE_METADATA_KEY,
-        TurnUsage,
-    )
+ChatEventRequest = None
+DEFAULT_REQUEST_OPTIONS = None
+USAGE_EVENT_TYPE = None
+USAGE_METADATA_KEY = None
+TurnUsage = None
+USAGE_SDK_AVAILABLE = False
 
+
+def _ensure_sdk_bindings() -> bool:
+    """Bind the SDK usage contract lazily, retrying after an early miss.
+
+    Directory plugins can be discovered before ``band-libs`` is installed or
+    prepended to ``sys.path``.  A one-shot module import would permanently
+    disable hook registration in that process even after dependencies become
+    available, so every registration attempt may retry the binding.
+    """
+    global ChatEventRequest, DEFAULT_REQUEST_OPTIONS
+    global USAGE_EVENT_TYPE, USAGE_METADATA_KEY, TurnUsage, USAGE_SDK_AVAILABLE
+
+    if USAGE_SDK_AVAILABLE:
+        return True
+    try:
+        from band.client.rest import (
+            ChatEventRequest as _ChatEventRequest,
+            DEFAULT_REQUEST_OPTIONS as _DEFAULT_REQUEST_OPTIONS,
+        )
+        from band.core.types import (
+            USAGE_EVENT_TYPE as _USAGE_EVENT_TYPE,
+            USAGE_METADATA_KEY as _USAGE_METADATA_KEY,
+            TurnUsage as _TurnUsage,
+        )
+    except Exception:
+        return False
+    ChatEventRequest = _ChatEventRequest
+    DEFAULT_REQUEST_OPTIONS = _DEFAULT_REQUEST_OPTIONS
+    USAGE_EVENT_TYPE = _USAGE_EVENT_TYPE
+    USAGE_METADATA_KEY = _USAGE_METADATA_KEY
+    TurnUsage = _TurnUsage
     USAGE_SDK_AVAILABLE = True
-except Exception:  # pragma: no cover - exercised only without the SDK
-    ChatEventRequest = None  # type: ignore[assignment]
-    DEFAULT_REQUEST_OPTIONS = None  # type: ignore[assignment]
-    USAGE_EVENT_TYPE = None  # type: ignore[assignment]
-    USAGE_METADATA_KEY = None  # type: ignore[assignment]
-    TurnUsage = None  # type: ignore[assignment]
-    USAGE_SDK_AVAILABLE = False
+    return True
+
+
+_ensure_sdk_bindings()
 
 
 PLATFORM_NAME = "band"
@@ -108,6 +137,9 @@ SCOPE_ALL = "all"
 SCOPE_HUB = "hub"
 SCOPE_OFF = "off"
 _SCOPES = (SCOPE_ALL, SCOPE_HUB, SCOPE_OFF)
+_TRUE_ALIASES = {"1", "true", "yes", "on"}
+_FALSE_ALIASES = {"0", "false", "no"}
+_STARTUP_SCOPE: Optional[str] = None
 
 # Mirrors the SDK's own event-content cap (band/runtime/tools.py).  Our content
 # is a short generated line, so truncation is a backstop, not an expected path;
@@ -117,9 +149,8 @@ _EVENT_CONTENT_MAX_LENGTH = 16384
 _EVENT_TRUNCATION_MARKER = "... [truncated] ..."
 _EVENT_EMPTY_CONTENT_PLACEHOLDER = "(no content)"
 
-# A turn that is interrupted, or fails before producing a final response, never
-# reaches post_llm_call — its bucket is never flushed.  Both caps bound that
-# leak: whichever trips first, stale buckets are dropped, not accumulated.
+# Caps remain a defensive backstop for process crashes and hosts that do not
+# provide the processing-complete lifecycle hook.
 _PENDING_MAX = 64
 _PENDING_TTL_SECONDS = 3600.0
 
@@ -139,9 +170,28 @@ def track_adapter(adapter: Any) -> None:
         _ACTIVE_ADAPTERS.add(adapter)
 
 
+def untrack_adapter(adapter: Any) -> None:
+    """Remove an adapter immediately when its connection is no longer live."""
+    with _ADAPTERS_LOCK:
+        _ACTIVE_ADAPTERS.discard(adapter)
+
+
 def _adapters() -> list:
     with _ADAPTERS_LOCK:
         return list(_ACTIVE_ADAPTERS)
+
+
+def _adapter_is_live(adapter: Any) -> bool:
+    loop = getattr(adapter, "_link_loop", None)
+    return bool(
+        getattr(adapter, "_link", None) is not None
+        and loop is not None
+        and loop.is_running()
+    )
+
+
+def _live_adapters() -> list:
+    return [adapter for adapter in _adapters() if _adapter_is_live(adapter)]
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +217,8 @@ _PENDING_LOCK = threading.Lock()
 def _scope() -> str:
     """Which rooms usage events go to.  ``BAND_EMIT_USAGE``, default ``off``.
 
-    Read per call so a change takes effect without a gateway restart, and so
-    the policy is testable without re-registering hooks.
+    This is startup configuration: ``off`` skips hook registration entirely,
+    so changing the value requires a gateway restart.
 
       off (default) — never emit; the hooks are not registered at all.
       all           — emit into the room the turn ran in.
@@ -203,10 +253,17 @@ def _scope() -> str:
     if raw in _SCOPES:
         return raw
     # Accept the usual boolean spellings so "true"/"false" do the obvious thing.
-    if raw in {"1", "true", "yes", "on"}:
+    if raw in _TRUE_ALIASES:
         return SCOPE_ALL
+    if raw in _FALSE_ALIASES:
+        return SCOPE_OFF
     # Anything else — unset, or a typo that must not silently start emitting.
     return SCOPE_OFF
+
+
+def _effective_scope() -> str:
+    """Use the scope captured during hook registration, if registration ran."""
+    return _STARTUP_SCOPE if _STARTUP_SCOPE is not None else _scope()
 
 
 def _platform_value(value: Any) -> str:
@@ -239,6 +296,8 @@ def _prune_locked(now: float) -> None:
 
 def on_post_api_request(**kwargs: Any) -> None:
     """Accumulate one API call's tokens into its turn's bucket."""
+    if not _ensure_sdk_bindings():
+        return
     if _platform_value(kwargs.get("platform")) != PLATFORM_NAME:
         # Deliberately silent: this fires on every API call of every platform
         # the gateway runs, and is the definition of a tight loop.
@@ -291,6 +350,35 @@ def on_post_llm_call(**kwargs: Any) -> None:
     if key is None:
         logger.debug("[band] usage: turn end carried no session id — nothing to flush")
         return
+    _flush_key(key)
+
+
+def flush_incomplete_turn(adapter: Any, session_id: str, room_id: str) -> None:
+    """Flush one failed/cancelled turn from its originating Band event.
+
+    Hermes serializes turns per resolved session.  Select the newest bucket for
+    this exact session without combining buckets; room and adapter resolution
+    are repeated at schedule and emit time so reconnect churn cannot target a
+    disconnected instance.
+    """
+    if not session_id or not room_id:
+        return
+    with _PENDING_LOCK:
+        candidates = [key for key in _PENDING if key[0] == session_id]
+        key = max(candidates, key=lambda item: _PENDING[item].created_at, default=None)
+    if key is None:
+        logger.debug("[band] usage: no accumulated usage for this turn — no event")
+        return
+    _flush_key(key, originating_adapter=adapter, originating_room=room_id)
+
+
+def _flush_key(
+    key: Tuple[str, str],
+    *,
+    originating_adapter: Any = None,
+    originating_room: Optional[str] = None,
+) -> None:
+    """Atomically pop and emit one bucket; all terminal paths converge here."""
     with _PENDING_LOCK:
         bucket = _PENDING.pop(key, None)
     if bucket is None:
@@ -307,15 +395,24 @@ def on_post_llm_call(**kwargs: Any) -> None:
         )
         return
 
-    scope = _scope()
+    scope = _effective_scope()
     if scope == SCOPE_OFF:
         logger.debug("[band] usage: suppressed by BAND_EMIT_USAGE=off")
         return
 
     session_id = key[0]
-    for adapter in _adapters():
-        room_id = _room_for_session(adapter, session_id)
+    adapters = _live_adapters()
+    # Prefer a still-live originating adapter, but never retain a disconnected
+    # one across reconnect.  The room id remains authoritative and is not
+    # rerouted to another room.
+    if originating_adapter in adapters:
+        adapters.remove(originating_adapter)
+        adapters.insert(0, originating_adapter)
+    for adapter in adapters:
+        room_id = originating_room or _room_for_session(adapter, session_id)
         if not room_id:
+            continue
+        if originating_room and _room_for_session(adapter, session_id) != room_id:
             continue
         if scope == SCOPE_HUB and room_id != getattr(adapter, "_hub_room_id", None):
             logger.debug(
@@ -324,14 +421,14 @@ def on_post_llm_call(**kwargs: Any) -> None:
                 room_id,
             )
             return
-        _schedule_emit(adapter, room_id, bucket)
+        _schedule_emit(session_id, room_id, bucket)
         return
     # Correctly filtered, not broken: the turn ran on the CLI or another
     # platform, so no Band adapter owns its session.
     logger.debug(
         "[band] usage: session maps to no Band room across %d adapter(s) — "
         "not a Band turn",
-        len(_adapters()),
+        len(adapters),
     )
 
 
@@ -433,8 +530,16 @@ def build_metadata(bucket: _Bucket) -> Dict[str, Any]:
     return metadata
 
 
-def _schedule_emit(adapter: Any, room_id: str, bucket: _Bucket) -> bool:
-    """Fire the emit onto the adapter's own link loop; never wait for it.
+def _current_adapter(session_id: str, room_id: str) -> Any:
+    """Return the live adapter that currently owns this session and room."""
+    for adapter in _live_adapters():
+        if _room_for_session(adapter, session_id) == room_id:
+            return adapter
+    return None
+
+
+def _schedule_emit(session_id: str, room_id: str, bucket: _Bucket) -> bool:
+    """Resolve the current adapter and fire onto its own link loop; never wait.
 
     The hooks run synchronously on the agent's thread, while the link's asyncio
     primitives are bound to the loop ``connect()`` ran on (the same constraint
@@ -442,20 +547,21 @@ def _schedule_emit(adapter: Any, room_id: str, bucket: _Bucket) -> bool:
     return immediately, so a slow or failing Band API call cannot add latency
     to — or raise into — the turn that produced it.
     """
-    link_loop = getattr(adapter, "_link_loop", None)
-    if link_loop is None or not link_loop.is_running():
+    adapter = _current_adapter(session_id, room_id)
+    if adapter is None:
         logger.debug(
-            "[band] usage: dropping event for room %s — link loop absent or stopped",
+            "[band] usage: dropping event for room %s — no live adapter owns it",
             room_id,
         )
         return False
+    link_loop = adapter._link_loop
     try:
         running = asyncio.get_running_loop()
     except RuntimeError:
         # Not an error and not swallowed: "no running loop" is the answer this
         # asks for — the hooks fire on the agent's thread. Nothing to report.
         running = None
-    coro = _emit(adapter, room_id, bucket)
+    coro = _emit(session_id, room_id, bucket)
     if running is link_loop:
         link_loop.create_task(coro)
     else:
@@ -463,15 +569,20 @@ def _schedule_emit(adapter: Any, room_id: str, bucket: _Bucket) -> bool:
     return True
 
 
-async def _emit(adapter: Any, room_id: str, bucket: _Bucket) -> None:
-    """Post the usage event. Swallows every failure by design."""
-    link = getattr(adapter, "_link", None)
-    if link is None:
+async def _emit(session_id: str, room_id: str, bucket: _Bucket) -> None:
+    """Re-resolve the current adapter, then post. Swallows every failure."""
+    adapter = _current_adapter(session_id, room_id)
+    if adapter is None:
         logger.debug(
-            "[band] usage: dropping event for room %s — adapter has no live link",
+            "[band] usage: dropping event for room %s — no live adapter owns it",
             room_id,
         )
         return
+    link_loop = adapter._link_loop
+    if asyncio.get_running_loop() is not link_loop:
+        asyncio.run_coroutine_threadsafe(_emit(session_id, room_id, bucket), link_loop)
+        return
+    link = adapter._link
     try:
         resp = await link.rest.agent_api_events.create_agent_chat_event(
             chat_id=room_id,
@@ -513,10 +624,14 @@ def register_hooks(ctx: Any) -> bool:
     a sanitized response payload for every API call it would otherwise skip, and
     no one should pay that for a feature they did not opt into.
     """
-    if not USAGE_SDK_AVAILABLE:
+    global _STARTUP_SCOPE
+
+    if not _ensure_sdk_bindings():
         logger.debug("[band] usage events disabled: SDK has no usage contract")
         return False
-    if _scope() == SCOPE_OFF:
+    if _STARTUP_SCOPE is None:
+        _STARTUP_SCOPE = _scope()
+    if _STARTUP_SCOPE == SCOPE_OFF:
         logger.debug(
             "[band] usage events off (default); set BAND_EMIT_USAGE=all to enable"
         )

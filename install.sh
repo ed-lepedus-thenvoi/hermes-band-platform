@@ -18,7 +18,7 @@
 # Env knobs:
 #   HERMES_HOME    Hermes home (default ~/.hermes)
 #   HERMES_PY      gateway interpreter override (skips auto-resolution)
-#   BAND_SDK_SPEC  band-sdk requirement (default: band-sdk>=1.0.0,<2.0.0)
+#   BAND_SDK_SPEC  band-sdk requirement (default: band-sdk>=1.3.0,<2.0.0)
 set -euo pipefail
 
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -27,7 +27,7 @@ command -v uv >/dev/null || die "install uv first: https://docs.astral.sh/uv/"
 command -v hermes >/dev/null || die "install hermes first (the hermes CLI must be on PATH)"
 
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-BAND_SDK_SPEC="${BAND_SDK_SPEC:-band-sdk>=1.0.0,<2.0.0}"
+BAND_SDK_SPEC="${BAND_SDK_SPEC:-band-sdk>=1.3.0,<2.0.0}"
 
 # Locate the plugin source next to this script. Two layouts are supported:
 # a repo checkout (hermes_band_platform/) and an extracted release bundle

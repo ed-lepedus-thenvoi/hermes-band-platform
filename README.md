@@ -140,7 +140,7 @@ hermes-band-platform/install.sh
 ```
 
 The installer stages the plugin into `$HERMES_HOME/plugins/band/`, resolves
-`band-sdk>=1.0.0,<2.0.0` **with the gateway's interpreter** (Python 3.11–3.13; correct wheels for
+`band-sdk>=1.3.0,<2.0.0` **with the gateway's interpreter** (Python 3.11–3.13; correct wheels for
 its platform) into the user-writable `$HERMES_HOME/band-libs/`, verifies `import band`, and runs
 `hermes plugins enable band`. The plugin prepends `band-libs` to `sys.path` at load, so the
 gateway venv is never written to — **no sudo, works when site-packages is read-only**. Re-running
@@ -179,7 +179,7 @@ Clones the repo root into `$HERMES_HOME/plugins/band` and enables it. **Director
 carry their own dependencies**, so resolve `band-sdk` into `band-libs` (no site-packages write):
 
 ```bash
-uv pip install --python "$HERMES_PY" --target "${HERMES_HOME:-$HOME/.hermes}/band-libs" 'band-sdk>=1.0.0,<2.0.0'
+uv pip install --python "$HERMES_PY" --target "${HERMES_HOME:-$HOME/.hermes}/band-libs" 'band-sdk>=1.3.0,<2.0.0'
 ```
 
 The plugin's loader shim finds `band-libs` on its own; if the SDK is still missing at load, the
@@ -301,11 +301,19 @@ has no DMs, so an un-mentioned message is ignored by design. A reply means you'r
 | `BAND_ALLOW_ALL` | Explicitly allow anyone in a room to talk to the agent. Redundant with the default Band-ACL trust; mainly useful to override a `BAND_ALLOWED_USERS` restriction. |
 | `BAND_TOOL_OWNERS` | Comma-separated `platform:user_id` identities allowed to drive Band actions (e.g. `telegram:<tg-id>`). The resolved Band owner is always authorized from Band rooms; this allowlist grants others. |
 | `BAND_GROUP_SESSIONS_PER_USER` | Split a group room into a separate session per participant (`true`) or keep one shared session for the whole room (`false`). Default `false`. |
+| `BAND_EMIT_USAGE` | Startup-only usage-event scope: `off` (default), `all`, or `hub`. `true`/`1`/`yes`/`on` alias `all`; `false`/`0`/`no` alias `off`; invalid values fail closed to `off`. Restart the gateway after changing it. |
 | `BAND_OWNER_ID` | Owner UUID override. Normally resolved from the agent identity on connect; anchors the hub and the owner-only gates. |
 | `BAND_HUB_ROOM` | Hub room UUID. Auto-created and persisted on first connect; set it to pin an existing room. |
 | `BAND_HOME_ROOM` | Main-channel override for cron / notification delivery (also set by `/sethome` from a Band room). Defaults to the hub. |
 | `BAND_HUB_FAILOVER_THRESHOLD` | Consecutive failed hub sends before failing over to a fresh hub room (default `3`). A successful hub send resets the count. See [Hub failover](#hub-failover). |
 | `BAND_HUB_FAILOVER_MAX_PER_CONNECT` | Backstop cap on hub failovers per gateway connection (default `5`). |
+
+Usage emission defaults to `off` while the SDK carries usage in task events and
+Band has no consumer for their structured metadata. `all` posts the aggregate in
+the room where that turn originated. `hub` posts only when the turn itself
+originated in the owner's hub; it never reroutes usage from another room into the
+hub. Because `off` avoids registering Hermes's per-API-call hook, changes to
+`BAND_EMIT_USAGE` take effect only after a gateway restart.
 
 ---
 

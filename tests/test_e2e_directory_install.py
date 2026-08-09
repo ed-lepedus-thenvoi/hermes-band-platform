@@ -111,7 +111,7 @@ def test_gateway_venv_is_actually_read_only(gateway_venv):
     """Negative control: the OLD install path must fail with Permission denied."""
     result = _run(
         ["uv", "pip", "install", "--python", str(gateway_venv["python"]),
-         "band-sdk>=1.0.0,<2.0.0"],
+         "band-sdk>=1.3.0,<2.0.0"],
         timeout=300,
     )
     assert result.returncode != 0

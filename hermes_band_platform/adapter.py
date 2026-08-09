@@ -564,12 +564,6 @@ class BandAdapter(BasePlatformAdapter):
         # Scoped-lock identity (best-effort; set in connect()).
         self._lock_identity: Optional[str] = None
 
-        # Make this adapter reachable from the per-turn usage hooks, which fire
-        # on the agent's thread with no adapter reference of their own. Held
-        # weakly there, so tracking here (rather than in connect/disconnect)
-        # costs nothing and cannot outlive the adapter.
-        usage_events.track_adapter(self)
-
     @property
     def name(self) -> str:
         return "Band"
@@ -616,6 +610,7 @@ class BandAdapter(BasePlatformAdapter):
         # unconditionally. Unused here: Band has no server-side buffered queue
         # to preserve across a reconnect, the same "ignore if you have no such
         # queue" pattern webhook.py uses.
+        usage_events.untrack_adapter(self)
         self._reset_failover_state()
         if not self._preflight_ok():
             return False
@@ -636,6 +631,7 @@ class BandAdapter(BasePlatformAdapter):
             await self._bootstrap_hub_safe()
             self._consumer_task = asyncio.create_task(self._consume())
             self._mark_connected()
+            usage_events.track_adapter(self)
             logger.info(
                 "[band] Connected as agent %s (handle=%s, owner=%s)",
                 _short_id(self._agent_id),
@@ -647,6 +643,7 @@ class BandAdapter(BasePlatformAdapter):
             self._schedule_catch_up()
             return True
         except Exception as e:
+            usage_events.untrack_adapter(self)
             logger.error("[band] Failed to connect: %s", e)
             self._set_fatal_error("connect_failed", str(e), retryable=True)
             self._release_lock()  # so a retry isn't blocked by our own lock
@@ -772,6 +769,7 @@ class BandAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Cancel the consumer, drop the link, release the scoped lock."""
+        usage_events.untrack_adapter(self)
         self._mark_disconnected()
 
         if self._catch_up_task and not self._catch_up_task.done():
@@ -1416,6 +1414,16 @@ class BandAdapter(BasePlatformAdapter):
             return
         msg_id = getattr(event, "message_id", None)
         room_id = getattr(getattr(event, "source", None), "chat_id", None)
+
+        # ``post_llm_call`` covers successful turns with a final response, but
+        # Hermes skips it for failures and interruptions. Resolve the exact
+        # session from this originating event and converge on usage_events'
+        # atomic pop. A reconnect may have replaced ``self`` by emit time, so
+        # the usage module resolves the currently live adapter for this room.
+        if outcome in (ProcessingOutcome.FAILURE, ProcessingOutcome.CANCELLED):
+            session_id = self._session_id_for_event(event)
+            usage_events.flush_incomplete_turn(self, session_id, room_id or "")
+
         if not msg_id or not room_id or not self._link:
             return
         try:
@@ -1430,6 +1438,39 @@ class BandAdapter(BasePlatformAdapter):
                 _short_id(msg_id),
                 e,
             )
+
+    def _session_id_for_event(self, event: MessageEvent) -> str:
+        """Resolve the persisted session id using the event's full source key."""
+        store = getattr(self, "_session_store", None)
+        source = getattr(event, "source", None)
+        if store is None or source is None:
+            return ""
+        try:
+            generate_key = getattr(store, "_generate_session_key", None)
+            if callable(generate_key):
+                key = generate_key(source)
+            else:
+                store_config = getattr(store, "config", None)
+                key = build_session_key(
+                    source,
+                    group_sessions_per_user=getattr(
+                        store_config, "group_sessions_per_user", False
+                    ),
+                    thread_sessions_per_user=getattr(
+                        store_config, "thread_sessions_per_user", False
+                    ),
+                )
+            peek = getattr(store, "peek_session_id", None)
+            if callable(peek):
+                return str(peek(key) or "")
+            ensure = getattr(store, "_ensure_loaded", None)
+            if callable(ensure):
+                ensure()
+            entry = (getattr(store, "_entries", None) or {}).get(key)
+            return str(getattr(entry, "session_id", "") or "")
+        except Exception as e:
+            logger.debug("[band] usage session resolution failed: %s", e)
+            return ""
 
     def _schedule_catch_up(self) -> None:
         """(Re)start the background catch-up drain for all known rooms.
@@ -2345,7 +2386,7 @@ def check_band_requirements() -> bool:
     specific names inside the function, binds them to module globals, and
     returns True; on ImportError it returns False.
 
-    To enable Hermes auto-install, a ``'platform.band': ('band-sdk>=1.0.0,<2.0.0',)``
+    To enable Hermes auto-install, a ``'platform.band': ('band-sdk>=1.3.0,<2.0.0',)``
     entry could be added to tools/lazy_deps.py and this could use
     ``tools.lazy_deps.ensure_and_bind``; deferred to keep zero core edits.
     """

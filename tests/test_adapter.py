@@ -1955,6 +1955,115 @@ class TestProcessingAckHooks:
         adapter._link.mark_processed.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "outcome", [ProcessingOutcome.FAILURE, ProcessingOutcome.CANCELLED]
+    )
+    async def test_incomplete_outcomes_flush_originating_usage(
+        self, adapter, monkeypatch, outcome
+    ):
+        flush = MagicMock()
+        monkeypatch.setattr(_band_mod.usage_events, "flush_incomplete_turn", flush)
+        monkeypatch.setattr(adapter, "_session_id_for_event", lambda event: "sid-1")
+        event = self._evt(room_id="room-abc")
+
+        await adapter.on_processing_complete(event, outcome)
+
+        flush.assert_called_once_with(adapter, "sid-1", "room-abc")
+
+    @pytest.mark.asyncio
+    async def test_success_does_not_use_incomplete_flush(self, adapter, monkeypatch):
+        flush = MagicMock()
+        monkeypatch.setattr(_band_mod.usage_events, "flush_incomplete_turn", flush)
+
+        await adapter.on_processing_complete(self._evt(), ProcessingOutcome.SUCCESS)
+
+        flush.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_incomplete_finalization_flushes_once(
+        self, adapter, monkeypatch
+    ):
+        usage = _band_mod.usage_events
+        usage._PENDING.clear()
+        monkeypatch.setenv("BAND_EMIT_USAGE", "all")
+        emitted = MagicMock(return_value=True)
+        monkeypatch.setattr(usage, "_schedule_emit", emitted)
+        flush = MagicMock(wraps=usage.flush_incomplete_turn)
+        monkeypatch.setattr(usage, "flush_incomplete_turn", flush)
+        monkeypatch.setattr(adapter, "_session_id_for_event", lambda event: "sid-1")
+        monkeypatch.setattr(usage, "_live_adapters", lambda: [adapter])
+        monkeypatch.setattr(usage, "_room_for_session", lambda a, sid: "room-abc")
+        usage.on_post_api_request(
+            session_id="sid-1",
+            turn_id="turn-1",
+            platform="band",
+            model="test-model",
+            provider="test-provider",
+            usage={
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+            },
+        )
+        source = adapter.build_source(chat_id="room-abc", chat_type="group")
+        first = _band_mod.MessageEvent(
+            text="hello", source=source, message_id="m1"
+        )
+        duplicate = _band_mod.MessageEvent(
+            text="hello", source=source, message_id="m1"
+        )
+
+        try:
+            await adapter.on_processing_complete(first, ProcessingOutcome.FAILURE)
+            await adapter.on_processing_complete(duplicate, ProcessingOutcome.FAILURE)
+        finally:
+            usage._PENDING.clear()
+
+        assert flush.call_count == 2
+        emitted.assert_called_once()
+        assert not hasattr(first, "_band_usage_finalized")
+        assert not hasattr(duplicate, "_band_usage_finalized")
+
+    def test_usage_session_resolution_uses_store_profile_key(self, adapter):
+        adapter.config.extra["group_sessions_per_user"] = True
+        source = adapter.build_source(
+            chat_id="room-abc", chat_type="group", user_id="user-7"
+        )
+        key = "agent:profile:review-profile:band:group:room-abc"
+        generate_key = MagicMock(return_value=key)
+        adapter._session_store = SimpleNamespace(
+            config=SimpleNamespace(group_sessions_per_user=False),
+            _generate_session_key=generate_key,
+            _ensure_loaded=lambda: None,
+            _entries={key: SimpleNamespace(session_id="sid-user-7")},
+        )
+
+        event = SimpleNamespace(source=source)
+
+        assert adapter._session_id_for_event(event) == "sid-user-7"
+        generate_key.assert_called_once_with(source)
+
+    def test_usage_session_resolution_fallback_uses_store_config(self, adapter):
+        adapter.config.extra["group_sessions_per_user"] = True
+        source = adapter.build_source(
+            chat_id="room-abc", chat_type="group", user_id="user-7"
+        )
+        key = _band_mod.build_session_key(
+            source, group_sessions_per_user=False, thread_sessions_per_user=False
+        )
+        adapter._session_store = SimpleNamespace(
+            config=SimpleNamespace(
+                group_sessions_per_user=False,
+                thread_sessions_per_user=False,
+            ),
+            _ensure_loaded=lambda: None,
+            _entries={key: SimpleNamespace(session_id="sid-shared")},
+        )
+
+        assert adapter._session_id_for_event(SimpleNamespace(source=source)) == "sid-shared"
+
+    @pytest.mark.asyncio
     async def test_internal_event_is_not_acked(self, adapter):
         # Participant notices carry no Band id — never touch the cursor.
         await adapter.on_processing_start(self._evt(internal=True))
@@ -2355,13 +2464,16 @@ class TestConnectDisconnect:
         assert adapter._agent_id == "resolved-agent-id"
         assert adapter._handle == "bot-handle"
         assert adapter._consumer_task is not None
+        assert adapter in _band_mod.usage_events._adapters()
 
         # Cleanup
         await adapter.disconnect()
+        assert adapter not in _band_mod.usage_events._adapters()
 
     @pytest.mark.asyncio
     async def test_connect_returns_false_on_link_exception(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
+        _band_mod.usage_events.track_adapter(adapter)
 
         monkeypatch.setattr(
             "gateway.status.acquire_scoped_lock",
@@ -2378,6 +2490,7 @@ class TestConnectDisconnect:
         monkeypatch.setattr(_band_mod, "BandLink", _bad_link)
         result = await adapter.connect()
         assert result is False
+        assert adapter not in _band_mod.usage_events._adapters()
 
     @pytest.mark.asyncio
     async def test_disconnect_cancels_consumer_task(self, monkeypatch):
