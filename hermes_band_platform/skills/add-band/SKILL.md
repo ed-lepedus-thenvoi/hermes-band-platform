@@ -68,7 +68,7 @@ If the user already knows the interpreter, pre-set `HERMES_PY` (or `HERMES_PYTHO
 resolver validates it instead of detecting — an override that can't import `hermes_cli.config`
 is a hard error, never silently replaced by a guess.
 
-Canonical install: the repo's **installer**, which ships the plugin as a **directory plugin** with zero site-packages writes — it works even when the gateway venv (e.g. `/opt/hermes/.venv` on hosted runtimes) is root-owned and read-only. It stages the plugin into `$HERMES_HOME/plugins/band/`, resolves `band-sdk>=1.0.0,<2.0.0` with the gateway interpreter into the user-writable `$HERMES_HOME/band-libs/` (the plugin prepends it to `sys.path` at load), verifies `import band`, and enables the plugin. Idempotent — safe to re-run:
+Canonical install: the repo's **installer**, which ships the plugin as a **directory plugin** with zero site-packages writes — it works even when the gateway venv (e.g. `/opt/hermes/.venv` on hosted runtimes) is root-owned and read-only. It stages the plugin into `$HERMES_HOME/plugins/band/`, resolves `band-sdk>=1.1.0,<2.0.0` with the gateway interpreter into the user-writable `$HERMES_HOME/band-libs/` (the plugin prepends it to `sys.path` at load), verifies `import band`, and enables the plugin. Idempotent — safe to re-run:
 
 ```bash
 # From the repo clone (this skill lives at <repo>/hermes_band_platform/skills/add-band):

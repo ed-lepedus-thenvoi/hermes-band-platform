@@ -7,7 +7,7 @@ cannot live there. The installer instead resolves it into a user-writable
 target dir::
 
     uv pip install --python "<gateway_python>" \
-        --target "$HERMES_HOME/band-libs" "band-sdk>=1.0.0,<2.0.0"
+        --target "$HERMES_HOME/band-libs" "band-sdk>=1.1.0,<2.0.0"
 
 and this shim prepends that dir to ``sys.path`` before anything imports
 ``band``. Prepending (not appending) makes ``band-libs`` authoritative when
@@ -37,7 +37,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-BAND_SDK_SPEC = "band-sdk>=1.0.0,<2.0.0"
+BAND_SDK_SPEC = "band-sdk>=1.1.0,<2.0.0"
 
 
 def hermes_home() -> Path:

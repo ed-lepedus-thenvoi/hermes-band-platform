@@ -8,6 +8,7 @@ BEFORE this module imports the adapter — so the adapter's top-level
 import asyncio
 import logging
 import sys
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -855,6 +856,16 @@ class TestHandleEvent:
         event = SimpleNamespace(type="room_deleted", room_id="del-room")
         await adapter._handle_event(event)
         adapter._link.unsubscribe_room.assert_called_once_with("del-room")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("event_type", ["room_removed", "room_deleted"])
+    async def test_room_departure_forgets_working_state(self, adapter, event_type):
+        adapter._working_reported["gone-room"] = time.monotonic()
+        event = SimpleNamespace(type=event_type, room_id="gone-room")
+
+        await adapter._handle_event(event)
+
+        assert "gone-room" not in adapter._working_reported
 
     @pytest.mark.asyncio
     async def test_unhandled_event_type_is_ignored(self, adapter):
@@ -2409,6 +2420,22 @@ class TestConnectDisconnect:
 
         await adapter.disconnect()
         fake_link.disconnect.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_forgets_working_state_for_reconnect(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        old_link = MagicMock()
+        old_link.disconnect = AsyncMock()
+        adapter._link = old_link
+        adapter._working_reported["room-1"] = time.monotonic()
+
+        await adapter.disconnect()
+
+        assert adapter._working_reported == {}
+        new_link = TestWorkingIndicator._link()
+        adapter._link = new_link
+        await adapter.send_typing("room-1")
+        assert new_link.calls == [("room-1", True)]
 
     @pytest.mark.asyncio
     async def test_disconnect_cancels_room_catch_up_tasks(self, monkeypatch):

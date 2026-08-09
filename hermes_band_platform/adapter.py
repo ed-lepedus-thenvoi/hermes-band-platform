@@ -851,6 +851,14 @@ class BandAdapter(BasePlatformAdapter):
         self._link = None
         self._link_loop = None
 
+        # Activity is ephemeral server-side state with a short TTL. Forget it
+        # locally once the link is gone so a reconnect's first working=True is
+        # never suppressed by a timestamp from the old connection. Do not try
+        # to clear every room remotely here: the map is capped at 2,000 rooms,
+        # and even individually bounded best-effort calls would make shutdown
+        # latency scale with its size. The platform TTL safely clears them.
+        self._working_reported.clear()
+
         self._release_lock()
         # _running is already cleared by _mark_disconnected() at the top.
         logger.info("[band] Disconnected")
@@ -1176,6 +1184,9 @@ class BandAdapter(BasePlatformAdapter):
         if etype in ("room_removed", "room_deleted"):
             room_id = getattr(event, "room_id", None)
             if room_id:
+                # The room is no longer addressable, so its ephemeral activity
+                # state cannot be retried and must not survive a later re-join.
+                self._working_reported.pop(room_id, None)
                 await self._link.unsubscribe_room(room_id)
                 self._participants_cache.pop(room_id, None)
                 self._last_human_sender.pop(room_id, None)
@@ -2442,9 +2453,9 @@ class BandAdapter(BasePlatformAdapter):
         that helper's braces — an indicator must never be able to break message
         delivery, which is the only thing that actually matters.
 
-        Missing on a band-sdk predating the activity API; treated as "cannot
-        report" rather than an error, mirroring how this module tolerates an
-        older SDK elsewhere (see ``replace_uuid_mentions``).
+        The package requires band-sdk >=1.1.0, where this helper first exists.
+        The defensive lookup still keeps activity reporting from breaking a
+        turn if an invalid or partially upgraded runtime reaches this method.
         """
         link = self._link
         report = getattr(link, "report_activity", None) if link is not None else None
@@ -2500,7 +2511,7 @@ def check_band_requirements() -> bool:
     specific names inside the function, binds them to module globals, and
     returns True; on ImportError it returns False.
 
-    To enable Hermes auto-install, a ``'platform.band': ('band-sdk>=1.0.0,<2.0.0',)``
+    To enable Hermes auto-install, a ``'platform.band': ('band-sdk>=1.1.0,<2.0.0',)``
     entry could be added to tools/lazy_deps.py and this could use
     ``tools.lazy_deps.ensure_and_bind``; deferred to keep zero core edits.
     """

@@ -34,19 +34,36 @@ wheels = [
 ]
 
 [[package]]
-name = "band-sdk"
-version = "1.0.0"
+name = "band-client-rest"
+version = "0.0.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "pydantic-core" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/21/e0/600527e9da77b0bda58ba6e48d16e6070ced930e699a656b609f360318b6/band_client_rest-0.0.10.tar.gz", hash = "sha256:d3a753d9cf479949264f7092b550b2616e93da68ab32f23acc2a06a6b69019c7", size = 106806, upload-time = "2026-06-12T15:26:44.651Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/2c/6c6d4a76d0bbe5a63103add4b50ebdc4184c28afe64b1f7271725087d4f1/band_client_rest-0.0.10-py3-none-any.whl", hash = "sha256:7b900a6fefd25f25677e20fb77378294d5f34e29d583ef5b197fe96724834d7a", size = 246079, upload-time = "2026-06-12T15:26:43.302Z" },
+]
+
+[[package]]
+name = "band-sdk"
+version = "1.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "band-client-rest" },
     { name = "cryptography" },
+    { name = "filelock" },
     { name = "phoenix-channels-python-client" },
+    { name = "pydantic-settings" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
-    { name = "thenvoi-client-rest" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/60/44/911cee490e6d352c8a0151cc42a21cd5b45a73d58760ea7c8569fc5c887e/band_sdk-1.0.0.tar.gz", hash = "sha256:583c6040fb307e84cecccd0519f76cacd21aae4875d4de3cdbb002c33bba7aec", size = 398567, upload-time = "2026-06-11T13:44:25.645Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6e/f2/c3da260130f2a1b88f11f02bfaf6bff1d7ddc1928b8194919648e83bedba/band_sdk-1.6.0.tar.gz", hash = "sha256:e670512eff1b4e5aef3f015e78f1cd15d66c9cd8513303945b14a28c18fc0a60", size = 562960, upload-time = "2026-08-03T10:22:51.417Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ce/0c/1b14b211e31f8b43e7f49b543a7a9b81c88fbc0909508f2e7fa1025570db/band_sdk-1.0.0-py3-none-any.whl", hash = "sha256:d5a107129ad118e7865cffba4bc730d003b38f30e41aa8a9ee8ccf5b5183f8aa", size = 417264, upload-time = "2026-06-11T13:44:23.745Z" },
+    { url = "https://files.pythonhosted.org/packages/7b/70/a10f87af7e094d22bc852af3a0f06027b2cacb432f68d91461b13f7fcee3/band_sdk-1.6.0-py3-none-any.whl", hash = "sha256:019bdf55b193d896029e226446ca822158ec1d5ca4da6fce01b636a4cf74ed8d", size = 594415, upload-time = "2026-08-03T10:22:49.528Z" },
 ]
 
 [[package]]
@@ -306,6 +323,15 @@ wheels = [
 ]
 
 [[package]]
+name = "filelock"
+version = "3.32.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f6/57/3ba6e6cb097f85b855b00163d169f35365f44277df044dcf96d55b8f62a3/filelock-3.32.2.tar.gz", hash = "sha256:c33351e1f49cae33414acbc6d56784e6ecee82514ec90795da1161fc4836b5b8", size = 217172, upload-time = "2026-07-29T22:46:04.895Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c1/e8/72f8cef9fdfeffe06213fe8508039396ee48daa0e3259457ed766173bfd6/filelock-3.32.2-py3-none-any.whl", hash = "sha256:87dd94cf281e586d135fa51132b8e3d9a598b316e90377a288663c9321036c82", size = 98830, upload-time = "2026-07-29T22:46:03.52Z" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -316,7 +342,7 @@ wheels = [
 
 [[package]]
 name = "hermes-band"
-version = "1.0.0"
+version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "band-sdk" },
@@ -334,7 +360,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "band-sdk", specifier = ">=1.0.0,<2.0.0" },
+    { name = "band-sdk", specifier = ">=1.1.0,<2.0.0" },
     { name = "build", marker = "extra == 'dev'", specifier = ">=1.2,<2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "==9.0.2" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = "==1.3.0" },
@@ -552,14 +578,14 @@ wheels = [
 
 [[package]]
 name = "phoenix-channels-python-client"
-version = "0.2.1"
+version = "0.2.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ad/53/dbabc21137c7f9657d5f02ac020aa1fab97747a409b393dca9a1ba752945/phoenix_channels_python_client-0.2.1.tar.gz", hash = "sha256:a5ff329d4ed0ce850c3568e39ec29beaf82540d18016d4934837374a612151a1", size = 29245, upload-time = "2026-04-12T12:46:38.53Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c3/db/6d489bc1ebd2ebfd3705f8790123a571a371e0ef67a6cec055cc32d8fcf0/phoenix_channels_python_client-0.2.3.tar.gz", hash = "sha256:36b9747e2c5029c9095b4b8c95908ccfb636556b0122be4aaf6fd33a529427a6", size = 29485, upload-time = "2026-07-23T15:18:02.662Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b2/06/1a37e48ead532b123ed71c5a5e4fd78d4fc93c11622887f41e18d14fedb6/phoenix_channels_python_client-0.2.1-py3-none-any.whl", hash = "sha256:24606551dfbcae35f3052f1573091c25b4da1deded4d6f62d171ff2820ed8ad4", size = 23930, upload-time = "2026-04-12T12:46:39.593Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/95/9cd4ae2708ce6890f0229cc2a6e4fdeb63d1cd1f158a35c37c556d4d30f8/phoenix_channels_python_client-0.2.3-py3-none-any.whl", hash = "sha256:34ff3f7151fd37d1a770558750f5793c3911bf0b264c8d3647b9412dfad05e20", size = 24196, upload-time = "2026-07-23T15:18:01.078Z" },
 ]
 
 [[package]]
@@ -695,6 +721,20 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ac/ad/5565071e937d8e752842ac241463944c9eb14c87e2d269f2658a5bd05e98/pydantic_core-2.46.4-pp311-pypy311_pp73-musllinux_1_1_armv7l.whl", hash = "sha256:d396ec2b979760aaf3218e76c24e65bd0aca24983298653b3a9d7a45f9e47b30", size = 2310000, upload-time = "2026-05-06T13:37:56.694Z" },
     { url = "https://files.pythonhosted.org/packages/4f/c3/66883a5cec183e7fba4d024b4cbbe61851a63750ef606b0afecc46d1f2bf/pydantic_core-2.46.4-pp311-pypy311_pp73-musllinux_1_1_x86_64.whl", hash = "sha256:86e1a4418c6cd97d60c95c71164158eaf7324fae7b0923264016baa993eba6fc", size = 2361286, upload-time = "2026-05-06T13:40:05.667Z" },
     { url = "https://files.pythonhosted.org/packages/4b/2d/69abac8f838090bbecd5df894befb2c2619e7996a98ddb949db9f3b93225/pydantic_core-2.46.4-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:d51026d73fcfd93610abc7b27789c26b313920fcfb20e27462d74a7f8b06e983", size = 2193071, upload-time = "2026-05-06T13:38:08.682Z" },
+]
+
+[[package]]
+name = "pydantic-settings"
+version = "2.15.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "python-dotenv" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/68/ca/31c57507b13119d7d3cfa1576dad2911a4861e3be07b579395f4e9d393f9/pydantic_settings-2.15.0.tar.gz", hash = "sha256:694b793e84f766ba76a90ebdefc01d0a9a045dab0382bee70393da93712ad117", size = 261253, upload-time = "2026-08-07T09:24:57.419Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/30/a4/2bffa9f8e804325a09867f0e9d30795c80ea9f8d62560bd1b6ad6220eb2f/pydantic_settings-2.15.0-py3-none-any.whl", hash = "sha256:0ba092c291c94baceb5eff768aa0d56400a457585bc0175925a5a5510303da42", size = 69413, upload-time = "2026-08-07T09:24:55.839Z" },
 ]
 
 [[package]]
@@ -928,21 +968,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/46/f5af3402b579fd5e11573ce652019a67074317e18c1935cc0b4ba9b35552/secretstorage-3.5.0-py3-none-any.whl", hash = "sha256:0ce65888c0725fcb2c5bc0fdb8e5438eece02c523557ea40ce0703c266248137", size = 15554, upload-time = "2025-11-23T19:02:51.545Z" },
-]
-
-[[package]]
-name = "thenvoi-client-rest"
-version = "0.0.7"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "httpx" },
-    { name = "pydantic" },
-    { name = "pydantic-core" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/54/b8/077727592881e2bce52d9cd4198ddff4d2109eb30a456fe29bdd84eacba0/thenvoi_client_rest-0.0.7.tar.gz", hash = "sha256:1f793a96449556c304bbecce79db0ae2d8044e32b6c137e50c608d09cd97ddb3", size = 95101, upload-time = "2026-04-12T13:22:44.949Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/41/f4/61b5a86a1f3bbaeb09f46a01d019a2c0df0f6bf57494745ee670eee9e68b/thenvoi_client_rest-0.0.7-py3-none-any.whl", hash = "sha256:60b572ed3b64d2acaf447e50f36ea064506c14ca6c7d6ca9b3b197ccbc68c70f", size = 233953, upload-time = "2026-04-12T13:22:43.351Z" },
 ]
 
 [[package]]

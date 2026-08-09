@@ -284,7 +284,7 @@ def verify_install() -> dict[str, Any]:
             "resolve it into the user-writable band-libs dir (needs no sudo and "
             "no site-packages write): "
             'uv pip install --python "$HERMES_PY" --target '
-            f"\"{band_libs['dir']}\" 'band-sdk>=1.0.0,<2.0.0' "
+            f"\"{band_libs['dir']}\" 'band-sdk>=1.1.0,<2.0.0' "
             "— then restart the gateway."
         )
     if "plugin_enabled" in missing:

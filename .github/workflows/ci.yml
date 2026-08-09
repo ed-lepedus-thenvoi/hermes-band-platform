@@ -5,6 +5,22 @@ on:
   pull_request:
 
 jobs:
+  minimum-sdk-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - name: Exercise real minimum SDK activity contract
+        env:
+          EXPECTED_BAND_SDK_VERSION: "1.1.0"
+        run: |
+          pip install 'band-sdk==1.1.0'
+          python -I scripts/check_band_sdk_contract.py
+
   test:
     runs-on: ubuntu-latest
     env:
@@ -22,26 +38,33 @@ jobs:
 
       - name: Install host + plugin
         run: |
-          # hermes-agent is the HOST (provides gateway/, tools/, ...); band-sdk
-          # is the runtime dep. Then install this plugin + dev extras.
+          # Build the plugin + dev environment from the regenerated lock first;
+          # it pins band-sdk 1.6.0. Then add the latest compatible Hermes host to
+          # that explicit venv; the locked Band version is asserted next.
           # uv drives the e2e directory-install test (and install.sh itself).
-          pip install 'hermes-agent>=0,<1' 'band-sdk>=1.0.0,<2.0.0' uv
-          pip install -e ".[dev]"
+          pip install uv
+          uv sync --locked --extra dev
+          uv pip install --python .venv/bin/python 'hermes-agent>=0,<1'
+
+      - name: Exercise locked SDK activity contract
+        env:
+          EXPECTED_BAND_SDK_VERSION: "1.6.0"
+        run: .venv/bin/python -I scripts/check_band_sdk_contract.py
 
       - name: Standalone-load guard
-        run: python scripts/standalone_import_check.py
+        run: .venv/bin/python scripts/standalone_import_check.py
 
       - name: Root manifest sync guard
         # The root plugin.yaml is generated from the packaged manifest (single
         # source of truth). Fail if it drifted — regenerate with
         # `python scripts/sync_root_manifest.py --write`.
-        run: python scripts/sync_root_manifest.py --check
+        run: .venv/bin/python scripts/sync_root_manifest.py --check
 
       - name: Lint
-        run: ruff check hermes_band_platform tests scripts __init__.py
+        run: .venv/bin/ruff check hermes_band_platform tests scripts __init__.py
 
       - name: Tests
-        run: python -m pytest tests -q
+        run: .venv/bin/python -m pytest tests -q
 
       - name: E2E — directory install on a read-only gateway venv
         # Simulates the hosted-runtime shape (/opt/hermes/.venv unwritable):
@@ -49,4 +72,4 @@ jobs:
         # all via user-writable $HERMES_HOME paths.
         env:
           HERMES_E2E: "1"
-        run: python -m pytest tests/test_e2e_directory_install.py -q
+        run: .venv/bin/python -m pytest tests/test_e2e_directory_install.py -q

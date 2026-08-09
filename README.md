@@ -140,7 +140,7 @@ hermes-band-platform/install.sh
 ```
 
 The installer stages the plugin into `$HERMES_HOME/plugins/band/`, resolves
-`band-sdk>=1.0.0,<2.0.0` **with the gateway's interpreter** (Python 3.11–3.13; correct wheels for
+`band-sdk>=1.1.0,<2.0.0` **with the gateway's interpreter** (Python 3.11–3.13; correct wheels for
 its platform) into the user-writable `$HERMES_HOME/band-libs/`, verifies `import band`, and runs
 `hermes plugins enable band`. The plugin prepends `band-libs` to `sys.path` at load, so the
 gateway venv is never written to — **no sudo, works when site-packages is read-only**. Re-running
@@ -179,7 +179,7 @@ Clones the repo root into `$HERMES_HOME/plugins/band` and enables it. **Director
 carry their own dependencies**, so resolve `band-sdk` into `band-libs` (no site-packages write):
 
 ```bash
-uv pip install --python "$HERMES_PY" --target "${HERMES_HOME:-$HOME/.hermes}/band-libs" 'band-sdk>=1.0.0,<2.0.0'
+uv pip install --python "$HERMES_PY" --target "${HERMES_HOME:-$HOME/.hermes}/band-libs" 'band-sdk>=1.1.0,<2.0.0'
 ```
 
 The plugin's loader shim finds `band-libs` on its own; if the SDK is still missing at load, the
