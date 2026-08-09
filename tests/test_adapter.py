@@ -3555,15 +3555,22 @@ class TestStandaloneSend:
 
     @staticmethod
     def _patch_rest(monkeypatch, rest):
-        """Route ``_standalone_send`` at the given fake REST client."""
-        monkeypatch.setattr(_band_mod, "_standalone_rest", lambda *a, **k: rest)
+        """Route the send at ``rest`` and expose its owned HTTP transport."""
+        seen = {}
+
+        def _factory(_api_key, _base_url, httpx_client):
+            seen["httpx_client"] = httpx_client
+            return rest
+
+        monkeypatch.setattr(_band_mod, "_standalone_rest", _factory)
+        return seen
 
     # ── happy path + room resolution ──────────────────────────────────────
 
     @pytest.mark.asyncio
     async def test_posts_to_explicit_chat_id(self, env):
         rest = _rest_stub([_participant("human-1", "Alice", "alice")])
-        self._patch_rest(env, rest)
+        seen = self._patch_rest(env, rest)
 
         result = await _standalone_send(_make_config(), "room-explicit", "cron output")
 
@@ -3578,6 +3585,7 @@ class TestStandaloneSend:
         assert create.await_args.kwargs["chat_id"] == "room-explicit"
         assert create.await_args.kwargs["message"].content == "cron output"
         assert _mention_tuples(create) == [[("human-1", "alice", "Alice")]]
+        assert seen["httpx_client"].is_closed
 
     @pytest.mark.asyncio
     async def test_falls_back_to_home_room_when_no_chat_id(self, env):
@@ -3622,9 +3630,10 @@ class TestStandaloneSend:
         rest = _rest_stub([_participant("human-1", "Alice", "alice")])
         seen: dict = {}
 
-        def _factory(api_key, base_url):
+        def _factory(api_key, base_url, httpx_client):
             seen["api_key"] = api_key
             seen["base_url"] = base_url
+            seen["httpx_client"] = httpx_client
             return rest
 
         env.setattr(_band_mod, "_standalone_rest", _factory)
@@ -3635,7 +3644,9 @@ class TestStandaloneSend:
         result = await _standalone_send(cfg, "room-1", "hi")
 
         assert result["success"] is True
-        assert seen == {"api_key": "key-extra", "base_url": "band.internal"}
+        assert seen["api_key"] == "key-extra"
+        assert seen["base_url"] == "band.internal"
+        assert seen["httpx_client"].is_closed
 
     # ── parity with the live _send_on_link path ───────────────────────────
 
@@ -3771,12 +3782,13 @@ class TestStandaloneSend:
         rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
             side_effect=RuntimeError("participants 503")
         )
-        self._patch_rest(env, rest)
+        seen = self._patch_rest(env, rest)
 
         result = await _standalone_send(_make_config(), "room-1", "hi")
 
         assert "participants 503" in result["error"]
         rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+        assert seen["httpx_client"].is_closed
 
     @pytest.mark.asyncio
     async def test_post_failure_returns_error_dict_instead_of_raising(self, env):
@@ -3784,16 +3796,17 @@ class TestStandaloneSend:
         rest.agent_api_messages.create_agent_chat_message = AsyncMock(
             side_effect=RuntimeError("network failure")
         )
-        self._patch_rest(env, rest)
+        seen = self._patch_rest(env, rest)
 
         result = await _standalone_send(_make_config(), "room-1", "hi")
 
         assert "network failure" in result["error"]
         assert "success" not in result
+        assert seen["httpx_client"].is_closed
 
     @pytest.mark.asyncio
     async def test_client_build_failure_is_reported(self, env):
-        def _boom(api_key, base_url):
+        def _boom(api_key, base_url, httpx_client):
             raise RuntimeError("no client")
 
         env.setattr(_band_mod, "_standalone_rest", _boom)
@@ -3838,40 +3851,45 @@ class TestStandaloneSend:
 
 
 class TestStandaloneRestClient:
-    """``_standalone_rest`` builds the SDK client from credentials alone."""
+    """``_standalone_rest`` injects the caller-owned HTTP transport."""
 
     def test_builds_async_rest_client_with_derived_url(self, monkeypatch):
         built: dict = {}
 
         class _FakeAsyncRestClient:
-            def __init__(self, api_key, base_url):
+            def __init__(self, api_key, base_url, httpx_client):
                 built["api_key"] = api_key
                 built["base_url"] = base_url
+                built["httpx_client"] = httpx_client
 
         monkeypatch.setattr(
             sys.modules["band.client.rest"], "AsyncRestClient", _FakeAsyncRestClient
         )
 
-        client = _band_mod._standalone_rest("secret-key", "band.internal:8443")
+        httpx_client = MagicMock()
+        client = _band_mod._standalone_rest(
+            "secret-key", "band.internal:8443", httpx_client
+        )
 
         assert isinstance(client, _FakeAsyncRestClient)
         assert built == {
             "api_key": "secret-key",
             "base_url": "https://band.internal:8443",
+            "httpx_client": httpx_client,
         }
 
     def test_default_host_when_no_base_url(self, monkeypatch):
         built: dict = {}
 
         class _FakeAsyncRestClient:
-            def __init__(self, api_key, base_url):
+            def __init__(self, api_key, base_url, httpx_client):
                 built["base_url"] = base_url
 
         monkeypatch.setattr(
             sys.modules["band.client.rest"], "AsyncRestClient", _FakeAsyncRestClient
         )
 
-        _band_mod._standalone_rest("secret-key", "")
+        _band_mod._standalone_rest("secret-key", "", MagicMock())
 
         assert built["base_url"] == "https://app.band.ai"
 

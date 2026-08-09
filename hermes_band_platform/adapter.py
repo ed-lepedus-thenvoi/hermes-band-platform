@@ -2476,13 +2476,13 @@ def _standalone_room(chat_id: Optional[str], extra: Dict[str, Any]) -> Optional[
     return None
 
 
-def _standalone_rest(api_key: str, base_url: str) -> Any:
+def _standalone_rest(api_key: str, base_url: str, httpx_client: Any) -> Any:
     """Build a REST client from credentials alone — no link, no gateway.
 
-    Mirrors ``BandLink``'s own construction (``AsyncRestClient(api_key=...,
-    base_url=rest_url)``) and the env-credential fallback ``tools._rest`` already
-    uses for out-of-process tool calls, deriving the REST URL through the shared
-    ``_derive_urls`` so a self-hosted ``BAND_BASE_URL`` resolves identically.
+    Mirrors ``BandLink``'s credentials and URL construction while accepting the
+    explicitly managed HTTP transport owned by ``_standalone_send``. The REST
+    URL still comes from shared ``_derive_urls`` so a self-hosted
+    ``BAND_BASE_URL`` resolves identically.
 
     Imported inside the function, not at module top: this module must import with
     no Band SDK (and no Hermes host) present.
@@ -2490,7 +2490,11 @@ def _standalone_rest(api_key: str, base_url: str) -> Any:
     from band.client.rest import AsyncRestClient
 
     _, rest_url = _derive_urls(base_url)
-    return AsyncRestClient(api_key=api_key, base_url=rest_url)
+    return AsyncRestClient(
+        api_key=api_key,
+        base_url=rest_url,
+        httpx_client=httpx_client,
+    )
 
 
 async def _standalone_send(
@@ -2582,9 +2586,19 @@ async def _standalone_send(
         }
 
     base_url = (os.getenv("BAND_BASE_URL") or extra.get("base_url", "")).strip()
+    httpx_client = None
     try:
-        rest = _standalone_rest(api_key, base_url)
+        # AsyncRestClient otherwise creates an httpx.AsyncClient that it does not
+        # expose a supported way to close. Own and inject the transport so every
+        # exit below can release its connection pool deterministically. These
+        # settings preserve the SDK's defaults when it creates the client itself.
+        from httpx import AsyncClient
+
+        httpx_client = AsyncClient(timeout=60, follow_redirects=True)
+        rest = _standalone_rest(api_key, base_url, httpx_client)
     except Exception as e:
+        if httpx_client is not None:
+            await httpx_client.aclose()
         logger.error(
             "[band] Standalone send could not build a REST client for room %s: %s",
             _short_id(room_id),
@@ -2593,63 +2607,66 @@ async def _standalone_send(
         return {"error": f"{_STANDALONE_PREFIX}: could not build a REST client: {e}"}
 
     try:
-        participants = await _fetch_participants(rest, room_id)
-    except Exception as e:
-        # The live path swallows this inside _get_participants and then fails on
-        # the empty mention list. Report the real cause instead: a cron job that
-        # cannot deliver should say why, not blame the mention list.
-        logger.error(
-            "[band] Standalone send could not fetch participants for room %s: %s",
+        try:
+            participants = await _fetch_participants(rest, room_id)
+        except Exception as e:
+            # The live path swallows this inside _get_participants and then fails on
+            # the empty mention list. Report the real cause instead: a cron job that
+            # cannot deliver should say why, not blame the mention list.
+            logger.error(
+                "[band] Standalone send could not fetch participants for room %s: %s",
+                _short_id(room_id),
+                e,
+            )
+            return {
+                "error": (
+                    f"{_STANDALONE_PREFIX}: could not fetch participants for room "
+                    f"{room_id}, needed for the mandatory @mention: {e}"
+                )
+            }
+
+        mention_items = _mention_items(participants, agent_id=agent_id)
+        if not mention_items:
+            logger.error(
+                "[band] Standalone send found no mentionable recipient in room %s "
+                "(%d participant(s)) — dropping",
+                _short_id(room_id),
+                len(participants),
+            )
+            return {
+                "error": (
+                    f"{_STANDALONE_PREFIX}: no mentionable recipient in room "
+                    f"{room_id} (Band requires >=1 mention per message)"
+                )
+            }
+
+        try:
+            last_id, _continuation, _last_resp = await _post_chunks(
+                rest,
+                room_id,
+                message,
+                mention_items,
+                BandAdapter.MAX_MESSAGE_LENGTH,
+            )
+        except Exception as e:
+            logger.error(
+                "[band] Standalone send failed for room %s: %s", _short_id(room_id), e
+            )
+            return {"error": f"{_STANDALONE_PREFIX}: {e}"}
+
+        logger.info(
+            "[band] Standalone send delivered to room %s (message id %s)",
             _short_id(room_id),
-            e,
+            _short_id(last_id),
         )
         return {
-            "error": (
-                f"{_STANDALONE_PREFIX}: could not fetch participants for room "
-                f"{room_id}, needed for the mandatory @mention: {e}"
-            )
+            "success": True,
+            "platform": "band",
+            "chat_id": room_id,
+            "message_id": last_id,
         }
-
-    mention_items = _mention_items(participants, agent_id=agent_id)
-    if not mention_items:
-        logger.error(
-            "[band] Standalone send found no mentionable recipient in room %s "
-            "(%d participant(s)) — dropping",
-            _short_id(room_id),
-            len(participants),
-        )
-        return {
-            "error": (
-                f"{_STANDALONE_PREFIX}: no mentionable recipient in room "
-                f"{room_id} (Band requires >=1 mention per message)"
-            )
-        }
-
-    try:
-        last_id, _continuation, _last_resp = await _post_chunks(
-            rest,
-            room_id,
-            message,
-            mention_items,
-            BandAdapter.MAX_MESSAGE_LENGTH,
-        )
-    except Exception as e:
-        logger.error(
-            "[band] Standalone send failed for room %s: %s", _short_id(room_id), e
-        )
-        return {"error": f"{_STANDALONE_PREFIX}: {e}"}
-
-    logger.info(
-        "[band] Standalone send delivered to room %s (message id %s)",
-        _short_id(room_id),
-        _short_id(last_id),
-    )
-    return {
-        "success": True,
-        "platform": "band",
-        "chat_id": room_id,
-        "message_id": last_id,
-    }
+    finally:
+        await httpx_client.aclose()
 
 
 # ---------------------------------------------------------------------------
