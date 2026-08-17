@@ -3039,14 +3039,12 @@ async def _standalone_send(
     "message_id": ...}`` or ``{"error": str}`` — never raises for an expected
     failure, because the error text is what the operator sees in the job result.
 
-    Send behaviour matches ``_send_on_link``: mentions come from the room's
-    participants via the shared ``_mention_items``, and chunking runs through
+    Send behaviour matches the live adapter's out-of-turn path: the OWNER is
+    addressed, resolved from ``BAND_OWNER_ID``, and chunking runs through
     ``_post_chunks`` at ``BandAdapter.MAX_MESSAGE_LENGTH`` with the mandatory
-    mention list repeated on every chunk. The one thing this path cannot
-    reproduce is ``_build_mentions``'s *preferred* last-human-sender — that cache
-    only exists on a connected adapter — so it always takes the
-    all-non-agent-participants branch, which is exactly what the live path does
-    for a room it has not yet heard a human speak in.
+    mention repeated on every chunk. Nothing here infers a recipient from who
+    happens to be in the room — a cron job must reach the same person whether or
+    not a gateway is running, which is the invariant the parity test now holds.
 
     ``thread_id`` is ignored: Band has rooms, not threads (the live ``send``
     ignores it too). ``media_files`` / ``force_document`` are accepted for
