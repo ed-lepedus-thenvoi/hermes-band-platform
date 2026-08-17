@@ -1,3 +1,4 @@
+
 """Shared test fixtures for the Band platform plugin.
 
 The band SDK is NOT assumed installed in the test environment. A minimal but
@@ -336,3 +337,19 @@ def _register_band_platform():
         hermes_band_platform.register(_RegistryCtx())
 
     yield
+
+
+@pytest.fixture(autouse=True)
+def _clean_turn_state():
+    """Turn state is module-level, so it must not leak between tests.
+
+    Whether a send is a model reply or out-of-turn traffic depends on whether a
+    turn is open for that room. One test opening a turn would otherwise change
+    what the next test's send does — which is exactly how this fixture came to
+    exist.
+    """
+    from hermes_band_platform.adapter import reset_turn_state
+
+    reset_turn_state()
+    yield
+    reset_turn_state()

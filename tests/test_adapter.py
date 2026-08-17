@@ -297,26 +297,33 @@ class TestBandPluginRegistration:
         register(ctx)
         return ctx.register_platform.call_args[1]["platform_hint"]
 
-    def test_platform_hint_does_not_claim_plain_text_is_undelivered(self):
-        """Regression guard: the gateway auto-delivers the final assistant text
-        and there is no way to suppress that, so a hint claiming otherwise makes
-        the model call band_send_message and every reply gets posted twice."""
-        hint = self._hint()
-        assert "plain text is not delivered" not in hint
-        assert "not delivered" not in hint
+    def test_platform_hint_tells_the_model_to_send_its_own_reply(self):
+        """The prompt and the code must agree, or one of two bugs follows.
 
-    def test_platform_hint_says_reply_is_delivered_and_mentioned_for_you(self):
+        If the hint says replies are delivered automatically while the code no
+        longer delivers them, every answer is silently demoted to a thought. If
+        it said the reverse while the code still delivered, every answer would
+        post twice — which is the bug the hint was previously written to fix.
+        Both halves therefore change together, and this pins the hint half.
+        """
         hint = self._hint()
-        assert "delivered to the room automatically" in hint
-        assert "@mentioned for you" in hint
+        assert "YOU MUST SEND YOUR REPLY YOURSELF" in hint
+        assert "band_send_message" in hint
+        assert "reply_to" in hint
 
-    def test_platform_hint_forbids_send_message_for_the_current_room(self):
+    def test_platform_hint_does_not_promise_automatic_delivery(self):
         hint = self._hint()
-        assert (
-            "Do NOT call band_send_message to reply in the room you are "
-            "already in" in hint
-        )
-        assert "twice" in hint
+        assert "delivered to the room automatically" not in hint
+        assert "@mentioned for you" not in hint
+        # The old guard against double-posting is now wrong advice: calling the
+        # tool is the only way to reach anyone.
+        assert "Do NOT call band_send_message to reply" not in hint
+
+    def test_platform_hint_explains_what_unsent_text_becomes(self):
+        """A model that forgets to send should be able to recognise the symptom."""
+        hint = self._hint()
+        assert "thought" in hint
+        assert "notifies nobody" in hint
 
     def test_platform_hint_keeps_owner_no_room_id_guidance(self):
         """Still-correct guidance the fix must not drop: reaching the owner from
@@ -545,11 +552,12 @@ class TestBandAdapterSend:
         adapter._link = mock_link
 
         # Seed last human sender so build_mentions has something to work with
-        adapter._last_human_sender["room-123"] = {
-            "id": "user-abc",
-            "handle": "userhandle",
-            "name": "User Name",
-        }
+        # Out-of-turn delivery addresses the owner (the hub pattern), so the
+        # owner is what has to be resolvable — not a "last sender".
+        adapter._owner_uuid = "owner-uuid"
+        adapter._participants_cache["room-123"] = [
+            {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
+        ]
 
         result = await adapter.send("room-123", "hello world")
         assert result.success is True
@@ -563,11 +571,12 @@ class TestBandAdapterSend:
             return_value=resp
         )
         adapter._link = mock_link
-        adapter._last_human_sender["room-99"] = {
-            "id": "user-x",
-            "handle": "ux",
-            "name": "User X",
-        }
+        # Out-of-turn delivery addresses the owner (the hub pattern), so the
+        # owner is what has to be resolvable — not a "last sender".
+        adapter._owner_uuid = "owner-uuid"
+        adapter._participants_cache["room-99"] = [
+            {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
+        ]
 
         await adapter.send("room-99", "test message")
         assert "tracked-id" in adapter._sent_ids
@@ -584,11 +593,12 @@ class TestBandAdapterSend:
 
         mock_link.rest.agent_api_messages.create_agent_chat_message = _fake_send
         adapter._link = mock_link
-        adapter._last_human_sender["room-big"] = {
-            "id": "user-y",
-            "handle": "uy",
-            "name": "User Y",
-        }
+        # Out-of-turn delivery addresses the owner (the hub pattern), so the
+        # owner is what has to be resolvable — not a "last sender".
+        adapter._owner_uuid = "owner-uuid"
+        adapter._participants_cache["room-big"] = [
+            {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
+        ]
 
         # Create content longer than MAX_MESSAGE_LENGTH (4000)
         long_content = "x" * 5000
@@ -604,11 +614,12 @@ class TestBandAdapterSend:
             side_effect=RuntimeError("network failure")
         )
         adapter._link = mock_link
-        adapter._last_human_sender["room-fail"] = {
-            "id": "user-z",
-            "handle": "uz",
-            "name": "User Z",
-        }
+        # Out-of-turn delivery addresses the owner (the hub pattern), so the
+        # owner is what has to be resolvable — not a "last sender".
+        adapter._owner_uuid = "owner-uuid"
+        adapter._participants_cache["room-fail"] = [
+            {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
+        ]
 
         result = await adapter.send("room-fail", "hi")
         assert result.success is False
@@ -629,7 +640,7 @@ class TestBandAdapterSend:
         mock_link.rest.agent_api_messages.create_agent_chat_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_send_builds_mentions_from_participants_when_no_last_sender(self, adapter):
+    async def test_out_of_turn_send_addresses_the_owner(self, adapter):
         mock_link = MagicMock()
         resp = SimpleNamespace(data=SimpleNamespace(id="msg-x"))
         mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
@@ -637,20 +648,22 @@ class TestBandAdapterSend:
         )
         adapter._link = mock_link
         adapter._agent_id = "agent-id-xxx"
+        adapter._owner_uuid = "owner-uuid"
 
         # Seed participants cache directly (skipping REST fetch)
         adapter._participants_cache["room-p"] = [
             {"id": "agent-id-xxx", "type": "Agent", "name": "Bot", "handle": "bot"},
+            {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
             {"id": "human-id", "type": "User", "name": "Alice", "handle": "alice"},
         ]
 
-        result = await adapter.send("room-p", "hello from fallback")
+        result = await adapter.send("room-p", "cron output, no turn open")
         assert result.success is True
-        # Ensure the call passed mentions
         call_kwargs = mock_link.rest.agent_api_messages.create_agent_chat_message.call_args[1]
         mentions = call_kwargs["message"].mentions
-        assert len(mentions) >= 1
-        assert any(getattr(m, "id", None) == "human-id" for m in mentions)
+        # Exactly the owner. Not every human in the room — that is the guess this
+        # design removes, and Alice never asked for this.
+        assert [getattr(m, "id", None) for m in mentions] == ["owner-uuid"]
 
     @pytest.mark.asyncio
     async def test_send_marshals_to_link_loop_when_called_from_another_loop(self, adapter):
@@ -672,9 +685,12 @@ class TestBandAdapterSend:
 
         mock_link.rest.agent_api_messages.create_agent_chat_message = _create
         adapter._link = mock_link
-        adapter._last_human_sender["room-x"] = {
-            "id": "user-x", "handle": "ux", "name": "User X",
-        }
+        # Out-of-turn delivery addresses the owner (the hub pattern), so the
+        # owner is what has to be resolvable — not a "last sender".
+        adapter._owner_uuid = "owner-uuid"
+        adapter._participants_cache["room-x"] = [
+            {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
+        ]
 
         # Run a dedicated "link" loop in its own thread and pin it on the adapter,
         # exactly as connect() would.
@@ -3328,7 +3344,12 @@ class TestHubFailover:
         a._hub_failover_threshold = 3
         a._hub_failover_max_per_connect = 5
         # Last human sender so send()'s mention build always succeeds.
-        a._last_human_sender["old-hub"] = {"id": "owner-1", "handle": "nir", "name": "Nir"}
+        # Out-of-turn delivery addresses the owner (the hub pattern), so the
+        # owner is what has to be resolvable — not a "last sender".
+        a._owner_uuid = "owner-uuid"
+        a._participants_cache["old-hub"] = [
+            {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
+        ]
         # Record .env persistence instead of writing the operator's real file.
         saved = {}
         import hermes_cli.config as _hcfg
@@ -3402,7 +3423,12 @@ class TestHubFailover:
             side_effect=RuntimeError("boom")
         )
         adapter._link = link
-        adapter._last_human_sender["other-room"] = {"id": "u", "handle": "u", "name": "U"}
+        # Out-of-turn delivery addresses the owner (the hub pattern), so the
+        # owner is what has to be resolvable — not a "last sender".
+        adapter._owner_uuid = "owner-uuid"
+        adapter._participants_cache["other-room"] = [
+            {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
+        ]
 
         await adapter.send("other-room", "hi")
         assert adapter._hub_send_failures == 0
@@ -3554,9 +3580,12 @@ class TestRendererCapabilities:
         delivery = pytest.importorskip("gateway.delivery")
 
         adapter = _make_adapter(monkeypatch)
-        adapter._last_human_sender["room-cron"] = {
-            "id": "user-c", "handle": "uc", "name": "User C",
-        }
+        # Out-of-turn delivery addresses the owner (the hub pattern), so the
+        # owner is what has to be resolvable — not a "last sender".
+        adapter._owner_uuid = "owner-uuid"
+        adapter._participants_cache["room-cron"] = [
+            {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
+        ]
         posted: list = []
 
         async def _create(*args, **kwargs):
@@ -3815,9 +3844,12 @@ class TestPostChunks:
         link = MagicMock()
         link.rest = _rest_stub()
         adapter._link = link
-        adapter._last_human_sender["room-1"] = {
-            "id": "human-1", "handle": "alice", "name": "Alice",
-        }
+        # Out-of-turn delivery addresses the owner (the hub pattern), so the
+        # owner is what has to be resolvable — not a "last sender".
+        adapter._owner_uuid = "owner-uuid"
+        adapter._participants_cache["room-1"] = [
+            {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
+        ]
 
         result = await adapter._send_on_link("room-1", "x" * 9000)
 
@@ -3864,9 +3896,16 @@ class TestStandaloneSend:
 
     @pytest.fixture
     def env(self, monkeypatch):
-        """Minimal out-of-process environment: credentials only, no home room."""
+        """Minimal out-of-process environment: credentials + owner, no home room.
+
+        The owner is part of the minimum now. Out-of-process delivery addresses
+        the owner — the hub pattern — so ``BAND_OWNER_ID`` is what makes a cron
+        send possible at all. It is persisted to the Hermes env on first connect
+        precisely so a process with no adapter in memory can read it.
+        """
         monkeypatch.setenv("BAND_AGENT_ID", "agent-self")
         monkeypatch.setenv("BAND_API_KEY", "secret-key")
+        monkeypatch.setenv("BAND_OWNER_ID", "owner-uuid")
         for var in ("BAND_BASE_URL", "BAND_HOME_ROOM", "BAND_HUB_ROOM"):
             monkeypatch.delenv(var, raising=False)
         return monkeypatch
@@ -3887,7 +3926,10 @@ class TestStandaloneSend:
 
     @pytest.mark.asyncio
     async def test_posts_to_explicit_chat_id(self, env):
-        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        rest = _rest_stub([
+            _participant("owner-uuid", "Owner", "owner"),
+            _participant("human-1", "Alice", "alice"),
+        ])
         seen = self._patch_rest(env, rest)
 
         result = await _standalone_send(_make_config(), "room-explicit", "cron output")
@@ -3902,13 +3944,17 @@ class TestStandaloneSend:
         create.assert_awaited_once()
         assert create.await_args.kwargs["chat_id"] == "room-explicit"
         assert create.await_args.kwargs["message"].content == "cron output"
-        assert _mention_tuples(create) == [[("human-1", "alice", "Alice")]]
+        # Out-of-turn delivery addresses the OWNER, not everyone in the room.
+        assert _mention_tuples(create) == [[("owner-uuid", "owner", "Owner")]]
         assert seen["httpx_client"].is_closed
 
     @pytest.mark.asyncio
     async def test_falls_back_to_home_room_when_no_chat_id(self, env):
         env.setenv("BAND_HOME_ROOM", "room-home")
-        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        rest = _rest_stub([
+            _participant("owner-uuid", "Owner", "owner"),
+            _participant("human-1", "Alice", "alice"),
+        ])
         self._patch_rest(env, rest)
 
         result = await _standalone_send(_make_config(), "", "hello")
@@ -3945,7 +3991,10 @@ class TestStandaloneSend:
         """PlatformConfig.extra is the secondary source, as in BandAdapter.__init__."""
         env.delenv("BAND_AGENT_ID")
         env.delenv("BAND_API_KEY")
-        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        rest = _rest_stub([
+            _participant("owner-uuid", "Owner", "owner"),
+            _participant("human-1", "Alice", "alice"),
+        ])
         seen: dict = {}
 
         def _factory(api_key, base_url, httpx_client):
@@ -3973,6 +4022,7 @@ class TestStandaloneSend:
         rest = _rest_stub(
             [
                 _participant("agent-self", "Bot", "bot", ptype="Agent"),
+                _participant("owner-uuid", "Owner", "owner"),
                 _participant("human-1", "Alice", "alice"),
             ]
         )
@@ -3981,13 +4031,17 @@ class TestStandaloneSend:
         result = await _standalone_send(_make_config(), "room-1", "hi")
 
         assert result["success"] is True
+        # The owner, and only the owner: not the agent itself and not bystanders.
         assert _mention_tuples(rest.agent_api_messages.create_agent_chat_message) == [
-            [("human-1", "alice", "Alice")]
+            [("owner-uuid", "owner", "Owner")]
         ]
 
     @pytest.mark.asyncio
     async def test_chunks_long_message_and_repeats_mentions_on_every_chunk(self, env):
-        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        rest = _rest_stub([
+            _participant("owner-uuid", "Owner", "owner"),
+            _participant("human-1", "Alice", "alice"),
+        ])
         self._patch_rest(env, rest)
         long_content = "x" * 9000
         expected_chunks = BandAdapter.truncate_message(
@@ -4000,23 +4054,25 @@ class TestStandaloneSend:
         create = rest.agent_api_messages.create_agent_chat_message
         assert [c.kwargs["message"].content for c in create.await_args_list] == expected_chunks
         # Band mandates >=1 mention per message, so continuations keep them.
-        assert _mention_tuples(create) == [[("human-1", "alice", "Alice")]] * len(
+        # Out-of-turn delivery addresses the OWNER, not everyone in the room.
+        assert _mention_tuples(create) == [[("owner-uuid", "owner", "Owner")]] * len(
             expected_chunks
         )
         # message_id is the LAST chunk's id, as in _send_on_link.
         assert result["message_id"] == f"std-msg-{len(expected_chunks)}"
 
     @pytest.mark.asyncio
-    async def test_mentions_match_the_live_path_for_a_room_with_no_cached_sender(self, env):
-        """Both paths take _mention_items' all-non-agent-participants branch.
+    async def test_matches_the_live_out_of_turn_path(self, env):
+        """Parity with the live adapter, restated for the current design.
 
-        The standalone path cannot reach ``_build_mentions``' preferred
-        last-human-sender (that cache lives on a connected adapter), so parity is
-        against the live path's behaviour for a room it has not heard from.
+        The old parity was against a recipient list both paths computed. Neither
+        computes one now: out-of-turn delivery addresses the owner, in-process or
+        not, and that is the invariant worth holding — a cron job must reach the
+        same person whether or not a gateway happens to be running.
         """
         participants = [
             _participant("agent-self", "Bot", "bot", ptype="Agent"),
-            _participant("human-1", "Alice", "alice"),
+            _participant("owner-uuid", "Owner", "owner"),
             _participant("human-2", "Bob", "bob"),
         ]
 
@@ -4026,17 +4082,23 @@ class TestStandaloneSend:
 
         adapter = _make_adapter(env, agent_id="agent-self")
         adapter._agent_id = "agent-self"
+        adapter._owner_uuid = "owner-uuid"
+        adapter._participants_cache["room-parity"] = [
+            {"id": p.id, "type": p.type, "name": p.name, "handle": p.handle}
+            for p in participants
+        ]
         live_link = MagicMock()
         live_link.rest = _rest_stub(participants)
         adapter._link = live_link
-        assert not adapter._last_human_sender  # cold room, no cached sender
-        live_result = await adapter._send_on_link("room-parity", "same text")
+        await adapter.send("room-parity", "same text")
 
-        assert live_result.success is True
-        assert _mention_tuples(standalone_rest.agent_api_messages.create_agent_chat_message) \
-            == _mention_tuples(live_link.rest.agent_api_messages.create_agent_chat_message)
-
-    # ── actionable failures ───────────────────────────────────────────────
+        standalone_mentions = _mention_tuples(
+            standalone_rest.agent_api_messages.create_agent_chat_message
+        )
+        live_mentions = _mention_tuples(
+            live_link.rest.agent_api_messages.create_agent_chat_message
+        )
+        assert standalone_mentions == live_mentions == [[("owner-uuid", "owner", "Owner")]]
 
     @pytest.mark.asyncio
     async def test_missing_api_key_names_the_variable(self, env):
@@ -4083,14 +4145,17 @@ class TestStandaloneSend:
         rest.agent_api_messages.create_agent_chat_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_no_mentionable_recipient_fails_without_posting(self, env):
-        # Agent-only room: nothing to mention once self is excluded.
-        rest = _rest_stub([_participant("agent-self", "Bot", "bot", ptype="Agent")])
+    async def test_unresolvable_owner_fails_without_posting(self, env):
+        # The recipient is the owner now, so the reachable failure is not having
+        # one. It must say so and post nothing, rather than mentioning whoever
+        # happens to be in the room.
+        env.delenv("BAND_OWNER_ID", raising=False)
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
         self._patch_rest(env, rest)
 
         result = await _standalone_send(_make_config(), "room-1", "hi")
 
-        assert "mention" in result["error"].lower()
+        assert "BAND_OWNER_ID" in result["error"]
         assert "success" not in result
         rest.agent_api_messages.create_agent_chat_message.assert_not_called()
 
@@ -4110,7 +4175,10 @@ class TestStandaloneSend:
 
     @pytest.mark.asyncio
     async def test_post_failure_returns_error_dict_instead_of_raising(self, env):
-        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        rest = _rest_stub([
+            _participant("owner-uuid", "Owner", "owner"),
+            _participant("human-1", "Alice", "alice"),
+        ])
         rest.agent_api_messages.create_agent_chat_message = AsyncMock(
             side_effect=RuntimeError("network failure")
         )
@@ -4147,7 +4215,10 @@ class TestStandaloneSend:
     @pytest.mark.asyncio
     async def test_accepts_the_full_sender_signature(self, env):
         """thread_id / media_files / force_document are parity-only, never fatal."""
-        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        rest = _rest_stub([
+            _participant("owner-uuid", "Owner", "owner"),
+            _participant("human-1", "Alice", "alice"),
+        ])
         self._patch_rest(env, rest)
 
         result = await _standalone_send(
@@ -4227,9 +4298,12 @@ class TestSendLogging:
         link = MagicMock()
         link.rest = _rest_stub()
         adapter._link = link
-        adapter._last_human_sender["room-1"] = {
-            "id": "human-1", "handle": "alice", "name": "Alice",
-        }
+        # Out-of-turn delivery addresses the owner (the hub pattern), so the
+        # owner is what has to be resolvable — not a "last sender".
+        adapter._owner_uuid = "owner-uuid"
+        adapter._participants_cache["room-1"] = [
+            {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
+        ]
         return adapter
 
     @staticmethod
@@ -4318,13 +4392,16 @@ class TestSendLogging:
 
     @pytest.mark.asyncio
     async def test_participant_fetch_logs_a_count_not_a_roster(self, caplog):
-        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        rest = _rest_stub([
+            _participant("owner-uuid", "Owner", "owner"),
+            _participant("human-1", "Alice", "alice"),
+        ])
         with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
             await _fetch_participants(rest, "room-1")
 
         counted = [r for r in caplog.records if "participant(s)" in r.getMessage()]
         assert len(counted) == 1
-        assert "1 participant(s)" in counted[0].getMessage()
+        assert "2 participant(s)" in counted[0].getMessage()
         # Names and handles are room data, not diagnostics.
         assert "Alice" not in caplog.text
         assert "alice" not in caplog.text
@@ -4390,12 +4467,13 @@ class TestStandaloneSendLogging:
         )
 
     @pytest.mark.asyncio
-    async def test_no_mentionable_recipient_is_logged_with_the_count(
+    async def test_unresolvable_owner_is_logged_at_error(
         self, monkeypatch, caplog
     ):
         monkeypatch.setenv("BAND_AGENT_ID", "agent-self")
         monkeypatch.setenv("BAND_API_KEY", "secret-key")
-        # Only the agent itself is in the room, so nobody can be @mentioned.
+        # No owner, so out-of-turn delivery has nobody to address.
+        monkeypatch.delenv("BAND_OWNER_ID", raising=False)
         rest = _rest_stub([_participant("agent-self", "Bot", "bot", ptype="Agent")])
         monkeypatch.setattr(_band_mod, "_standalone_rest", lambda *a, **k: rest)
 
@@ -4405,13 +4483,17 @@ class TestStandaloneSendLogging:
         assert "error" in result
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert len(errors) == 1
-        assert "1 participant(s)" in errors[0].getMessage()
+        # Names the missing thing, so an operator can fix it without reading code.
+        assert "BAND_OWNER_ID" in errors[0].getMessage()
 
     @pytest.mark.asyncio
     async def test_delivery_reports_the_message_id(self, monkeypatch, caplog):
         monkeypatch.setenv("BAND_AGENT_ID", "agent-self")
         monkeypatch.setenv("BAND_API_KEY", "secret-key")
-        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        rest = _rest_stub([
+            _participant("owner-uuid", "Owner", "owner"),
+            _participant("human-1", "Alice", "alice"),
+        ])
         monkeypatch.setattr(_band_mod, "_standalone_rest", lambda *a, **k: rest)
 
         with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
@@ -4704,3 +4786,83 @@ class TestWorkingIndicatorLogging:
             await adapter.stop_typing("room-never-typed")
 
         assert caplog.records == []
+
+
+# ---------------------------------------------------------------------------
+# splits_long_messages under the deliberate-send design
+# ---------------------------------------------------------------------------
+
+class TestSplitsLongMessagesStaysTrue:
+    """The capability is still true, and it is now also load-bearing.
+
+    It tells the host's delivery router "this adapter chunks in send(), do not
+    truncate for me". Two things had to be checked before leaving it True, since
+    ``send()`` no longer posts the model's replies:
+
+    1. The paths the flag actually governs — cron and other out-of-turn delivery
+       — still chunk, so the claim remains honest.
+    2. A False value would make the router chunk and call ``send()`` once per
+       piece. Only the first call would see the open turn; the rest would look
+       like out-of-turn traffic and be delivered to the owner separately. The
+       flag is what guarantees one send per delivery.
+    """
+
+    def test_capability_is_declared(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.splits_long_messages is True
+
+    @pytest.mark.asyncio
+    async def test_out_of_turn_delivery_chunks_and_repeats_the_owner_mention(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter(monkeypatch)
+        adapter._agent_id = "agent-self"
+        adapter._owner_uuid = "owner-uuid"
+        adapter._participants_cache["room-cron-long"] = [
+            {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
+        ]
+        link = MagicMock()
+        link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=SimpleNamespace(id="m"))
+        )
+        adapter._link = link
+
+        long_content = "x" * (adapter.MAX_MESSAGE_LENGTH * 2 + 10)
+        result = await adapter.send("room-cron-long", long_content)
+
+        create = link.rest.agent_api_messages.create_agent_chat_message
+        assert result.success is True
+        assert create.await_count >= 3, "long cron output must be chunked, not truncated"
+        # Band needs a mention per message, so every chunk carries the owner.
+        for call in create.await_args_list:
+            mentions = call.kwargs["message"].mentions
+            assert [getattr(m, "id", None) for m in mentions] == ["owner-uuid"]
+
+    @pytest.mark.asyncio
+    async def test_a_second_send_in_one_turn_is_not_treated_as_cron(self, monkeypatch):
+        """Why the flag must not become False.
+
+        If the router chunked, ``send()`` would be called repeatedly for one
+        reply. The first call closes the turn; a second would find no open turn
+        and be delivered to the owner as if it were scheduled output. Pinning the
+        behaviour makes that consequence visible rather than surprising.
+        """
+        adapter = _make_adapter(monkeypatch)
+        adapter._agent_id = "agent-self"
+        adapter._owner_uuid = "owner-uuid"
+        adapter._participants_cache["room-two"] = [
+            {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
+        ]
+        link = MagicMock()
+        link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=SimpleNamespace(id="m"))
+        )
+        link.rest.agent_api_events.create_agent_chat_event = AsyncMock()
+        adapter._link = link
+
+        _band_mod.begin_turn("room-two")
+        await adapter.send("room-two", "first half")   # turn open -> thought
+        await adapter.send("room-two", "second half")  # turn closed -> owner
+
+        assert link.rest.agent_api_events.create_agent_chat_event.await_count == 1
+        assert link.rest.agent_api_messages.create_agent_chat_message.await_count >= 1

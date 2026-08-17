@@ -342,8 +342,19 @@ the default is the private one and widening it is a deliberate act.
   (backlog enumeration, rehydration) rather than being handed it by `/next`.
 - **Self-filter**: the adapter skips its own agent messages by sender, with a sent-message-id
   backstop in addition to the SDK's own filtering.
-- **Outbound**: posts via the REST client, chunking long messages. Each reply @mentions the
-  room's last human sender (falling back to all non-agent participants).
+- **Outbound — you send your own replies.** Nothing the model writes is delivered for it. The
+  model calls `band_send_message` with the recipients it means, normally `reply_to` set to the
+  id of the message being answered, which addresses that message's author with no lookup.
+  Recipients are never inferred: an unresolvable one is an error the model can act on, not a
+  guess nobody can see.
+- **Text produced without sending it becomes a `thought`** — visible in the room, addressed to
+  nobody, notifying nobody. A forgotten send therefore leaves a trace instead of silence.
+- **Out-of-turn delivery addresses the owner.** Cron output, the hub greeting and hub failover
+  arrive when no turn is open, so they are delivered into the room and @mention the owner —
+  the participant a hub room is defined by. This is the pattern the Telegram adapter uses for
+  its home channel, adapted to Band's requirement of at least one mention per message.
+  `splits_long_messages` stays `True`: those paths do chunk, and the flag is what keeps the
+  delivery router from chunking for us and calling `send()` once per piece.
 - **Outbound without a gateway**: the plugin also registers a `standalone_sender_fn`, so a
   `deliver: band` cron job delivers even when it fires in a process that holds no gateway runner —
   a forced `hermes cron run <id>` is the everyday case. That path has no link and no caches, so it

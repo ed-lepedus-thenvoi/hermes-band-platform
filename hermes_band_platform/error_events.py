@@ -477,6 +477,51 @@ async def emit_error_event(
         return False
 
 
+async def emit_thought_event(adapter: Any, room_id: str, content: str) -> bool:
+    """Post the turn's final text as a ``thought``. Never raises.
+
+    A thought is content the agent produced without addressing anyone, which is
+    exactly what an unaddressed final reply is — Band's own model treats it that
+    way. And like every event a thought is exempt from the mention requirement,
+    so these words can land without the adapter inventing a recipient for them.
+
+    Shares the event seam with :func:`emit_error_event` rather than
+    ``adapter.send``, since that message path is the one being replaced.
+    """
+    link = getattr(adapter, "_link", None)
+    sdk_available = _load_error_event_sdk()
+    if link is None or not sdk_available:
+        logger.warning(
+            "[band] Dropping unaddressed final text for room %s — %s",
+            _short(room_id),
+            "adapter has no live link" if link is None else "band-sdk unavailable",
+        )
+        return False
+    body = _truncate_event_content(content or "") or _EVENT_EMPTY_CONTENT_PLACEHOLDER
+    try:
+        await link.rest.agent_api_events.create_agent_chat_event(
+            chat_id=room_id,
+            event=ChatEventRequest(
+                content=body,
+                message_type=BandMessageType.THOUGHT,
+                metadata=None,
+            ),
+            request_options=DEFAULT_REQUEST_OPTIONS,
+        )
+        # Length only. This is the model's own prose and has no business in a log.
+        logger.debug(
+            "[band] Emitted thought event to room %s (%d chars)",
+            _short(room_id),
+            len(body),
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            "[band] Could not emit thought event to room %s: %s", _short(room_id), e
+        )
+        return False
+
+
 async def report_turn_failure(adapter: Any, event: Any, outcome: Any) -> None:
     """Surface a failed turn in its room as a Band ``error`` event.
 

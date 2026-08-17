@@ -82,6 +82,12 @@ def adapter(monkeypatch):
     a = _make_adapter(monkeypatch)
     a._agent_id = "agent-uuid-1234"
     a._link = _event_link()
+    # Out-of-turn delivery addresses the owner, so the owner has to be resolvable
+    # for a send to reach the point where its outcome is recorded at all.
+    a._owner_uuid = "owner-uuid"
+    a._participants_cache["room-abc"] = [
+        {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
+    ]
     return a
 
 
@@ -341,20 +347,21 @@ class TestReason:
         assert _events_mod.pop_send_failure(adapter, "room-abc") is None
 
     @pytest.mark.asyncio
-    async def test_send_path_records_the_missing_mention_failure(self, adapter):
-        # The Band-specific silent failure: no mentionable recipient means the
-        # reply is dropped before it is ever posted.
-        adapter._build_mentions = AsyncMock(return_value=[])
+    async def test_send_path_records_an_unresolvable_owner(self, adapter):
+        # The Band-specific silent failure, in its current form. Recipients are
+        # no longer guessed, so "nobody to mention" is not reachable; what is
+        # reachable is out-of-turn delivery with no owner to address, and it must
+        # still leave a reason behind rather than vanishing.
+        adapter._owner_uuid = None
         result = await adapter.send("room-abc", "a reply nobody will see")
         assert result.success is False
         assert (
             _events_mod.pop_send_failure(adapter, "room-abc")
-            == "No mentionable recipient (Band requires >=1 mention)"
+            == "No owner resolved, so out-of-turn delivery has no recipient"
         )
 
     @pytest.mark.asyncio
     async def test_send_path_records_api_errors(self, adapter):
-        adapter._build_mentions = AsyncMock(return_value=[MagicMock()])
         adapter._link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
             side_effect=RuntimeError("422 Unprocessable Entity")
         )
@@ -363,7 +370,6 @@ class TestReason:
 
     @pytest.mark.asyncio
     async def test_send_path_clears_the_reason_on_success(self, adapter):
-        adapter._build_mentions = AsyncMock(return_value=[MagicMock()])
         adapter._link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
             return_value=SimpleNamespace(data=SimpleNamespace(id="sent-1"))
         )

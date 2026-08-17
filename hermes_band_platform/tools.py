@@ -47,6 +47,8 @@ from tools.registry import tool_error, tool_result
 # adapter module is safe even when the SDK is absent (it guards its own import).
 from .adapter import (
     DEFAULT_REQUEST_OPTIONS,
+    note_deliberate_send,
+    sender_of,
     _derive_urls,
     _mention_items,
     _short_id,
@@ -687,6 +689,25 @@ async def _handle_send_message(args: dict, **kwargs) -> str:
         mention_ids = args.get("mention_ids")
         if mention_ids is not None and not isinstance(mention_ids, list):
             mention_ids = [mention_ids]
+
+        # reply_to is the primary way to address a reply: the model names the
+        # MESSAGE it is answering and we resolve its author. That keeps the
+        # choice deliberate while sparing the model a roster lookup — and a
+        # failed roster lookup falling back to the owner is exactly how replies
+        # ended up addressed to bystanders.
+        reply_to = args.get("reply_to")
+        if reply_to and mention_ids is None:
+            author = sender_of(str(reply_to))
+            if not author or not author.get("id"):
+                # Hard error, never a fallback. An unresolvable recipient is
+                # something the model can act on; a guess is something nobody
+                # can see.
+                return tool_error(
+                    f"reply_to {reply_to!s} is not a message this agent has seen "
+                    "recently — pass mention_ids explicitly instead"
+                )
+            mention_ids = [author["id"]]
+
         # When reaching the owner via the hub fallback with no explicit mentions,
         # @mention the owner specifically so "message me" always pings the owner.
         if mention_ids is None and fell_back_to_home:
@@ -705,12 +726,41 @@ async def _handle_send_message(args: dict, **kwargs) -> str:
             )
             last_id = getattr(getattr(resp, "data", None), "id", None) or last_id
 
+        # This is the deliberate send. Recording it tells the adapter the model
+        # has addressed this room itself, so the host's copy of the final text is
+        # dropped rather than posted again (see the deliberate-send registry).
+        note_deliberate_send(room_id)
+        await _record_send_outcome(room_id, ok=True)
+
         logger.info(
             "[band.tools] Sent message to room %s (chunks=%d)", _short_id(room_id), len(chunks)
         )
         return tool_result({"success": True, "room_id": room_id, "message_id": last_id})
     except Exception as exc:
         return _tool_exc(exc)
+
+
+async def _record_send_outcome(room_id: str, *, ok: bool, error: Any = None) -> None:
+    """Hand a deliberate send's outcome back to the live adapter, if there is one.
+
+    Hub failover keys off consecutive main-channel send failures. Those sends
+    used to pass through the adapter; now the tools pass owns them, so the
+    outcome has to travel back or the failover threshold would never be reached
+    and the main channel would lose its protection silently.
+
+    Best-effort by construction: out-of-process callers (cron) have no adapter,
+    and a failure to record must never fail the send that succeeded.
+    """
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        adapter = runner.adapters.get(Platform("band")) if runner else None
+        if adapter is None:
+            return
+        await adapter.record_addressed_send(room_id, ok=ok, error=error)
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        logger.debug("[band.tools] Could not record send outcome: %s", exc)
 
 
 async def _handle_add_participant(args: dict, **kwargs) -> str:
@@ -887,10 +937,22 @@ BAND_SEND_MESSAGE_SCHEMA = {
         "type": "object",
         "properties": {
             "content": {"type": "string", "description": "Message text to send."},
+            "reply_to": {
+                "type": "string",
+                "description": (
+                    "Id of the message you are answering. Preferred way to reply: "
+                    "its author is addressed for you, with no lookup. Errors if "
+                    "that message is not in the recent window."
+                ),
+            },
             "mention_ids": {
                 "type": "array",
                 "items": _STRING,
-                "description": "Participant UUIDs to @mention. If omitted, all non-agent participants are mentioned.",
+                "description": (
+                    "Participant UUIDs to @mention. Use for fan-out, or to address "
+                    "someone who has not spoken. Takes precedence over reply_to. "
+                    "If both are omitted, every non-agent participant is mentioned."
+                ),
             },
             "room_id": _ROOM_ID_PROP,
         },
