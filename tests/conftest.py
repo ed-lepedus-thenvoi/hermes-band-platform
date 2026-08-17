@@ -353,3 +353,26 @@ def _clean_turn_state():
     reset_turn_state()
     yield
     reset_turn_state()
+
+
+@pytest.fixture(autouse=True)
+def _never_write_a_real_env(monkeypatch):
+    """No test may persist to the gateway's real ``.env``.
+
+    ``connect()`` persists the resolved owner and hub room by calling
+    ``hermes_cli.config.save_env_value``. A test that fakes an identity and does
+    not stub that call writes its fixture values into whatever ``HERMES_HOME``
+    happens to point at — so running this suite inside a live agent profile
+    rewrites that agent's identity.
+
+    That is not hypothetical: it overwrote both dogfooding twins'
+    ``BAND_OWNER_ID`` with the literal ``owner-uuid-abc`` from a fixture in this
+    file, leaving them pointed at a participant that does not exist. Default to a
+    no-op; tests that assert persistence patch the same attribute themselves and
+    keep working.
+    """
+    try:
+        import hermes_cli.config as _hermes_cfg
+    except Exception:  # pragma: no cover - host not installed
+        return
+    monkeypatch.setattr(_hermes_cfg, "save_env_value", lambda *_a, **_k: None)
