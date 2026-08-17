@@ -4866,3 +4866,46 @@ class TestSplitsLongMessagesStaysTrue:
 
         assert link.rest.agent_api_events.create_agent_chat_event.await_count == 1
         assert link.rest.agent_api_messages.create_agent_chat_message.await_count >= 1
+
+
+class TestEmptyFinalTextIsNotPosted:
+    """Band rejects a blank message with 422 "content can't be blank".
+
+    The host can hand over empty final text — an interrupted turn, or one that
+    only made tool calls — so both branches have to treat that as nothing to do
+    rather than posting an empty body. Observed live on the twins before this
+    guard existed.
+    """
+
+    def _adapter(self, monkeypatch):
+        a = _make_adapter(monkeypatch)
+        a._agent_id = "agent-self"
+        a._owner_uuid = "owner-uuid"
+        a._participants_cache["room-e"] = [
+            {"id": "owner-uuid", "type": "User", "name": "Owner", "handle": "owner"},
+        ]
+        link = MagicMock()
+        link.rest.agent_api_messages.create_agent_chat_message = AsyncMock()
+        link.rest.agent_api_events.create_agent_chat_event = AsyncMock()
+        a._link = link
+        return a, link
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blank", ["", "   ", "\n\t "])
+    async def test_out_of_turn_blank_posts_nothing(self, monkeypatch, blank):
+        adapter, link = self._adapter(monkeypatch)
+
+        result = await adapter.send("room-e", blank)
+
+        assert result.success is True
+        link.rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_in_turn_blank_posts_no_thought(self, monkeypatch):
+        adapter, link = self._adapter(monkeypatch)
+        _band_mod.begin_turn("room-e")
+
+        result = await adapter.send("room-e", "   ")
+
+        assert result.success is True
+        link.rest.agent_api_events.create_agent_chat_event.assert_not_awaited()

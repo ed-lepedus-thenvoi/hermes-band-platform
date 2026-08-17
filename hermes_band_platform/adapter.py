@@ -2604,6 +2604,17 @@ class BandAdapter(BasePlatformAdapter):
         change removes. Chunking is the adapter's own, which is what
         ``splits_long_messages`` promises the delivery router.
         """
+        if not (content or "").strip():
+            # Band rejects a blank message (422 "content can't be blank"). The
+            # host can hand over empty final text — an interrupted turn, a turn
+            # that only made tool calls — and there is nothing to deliver, so
+            # this is a no-op rather than a failure.
+            logger.debug(
+                "[band] Nothing to deliver out-of-turn to room %s (empty content)",
+                _short_id(room_id),
+            )
+            return SendResult(success=True, message_id=None)
+
         if not self._owner_uuid:
             reason = "No owner resolved, so out-of-turn delivery has no recipient"
             logger.error("[band] %s (room %s)", reason, _short_id(room_id))
@@ -2672,6 +2683,12 @@ class BandAdapter(BasePlatformAdapter):
         appear to have done nothing, and an operator reading the room can tell
         the difference between "said nothing" and "said something to no one".
         """
+        if not (content or "").strip():
+            logger.debug(
+                "[band] No unaddressed text to post as a thought for room %s",
+                _short_id(room_id),
+            )
+            return SendResult(success=True, message_id=None)
         ok = await emit_thought_event(self, room_id, content)
         if ok:
             logger.info(
