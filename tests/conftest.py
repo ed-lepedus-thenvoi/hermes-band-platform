@@ -376,3 +376,23 @@ def _never_write_a_real_env(monkeypatch):
     except Exception:  # pragma: no cover - host not installed
         return
     monkeypatch.setattr(_hermes_cfg, "save_env_value", lambda *_a, **_k: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_band_env_leak(monkeypatch):
+    """Every test starts with no ambient Band credentials.
+
+    Tests that need them set them. Without this, a test that forgets one can
+    still pass by inheriting another test's value through os.environ, and then
+    fails in isolation or on CI in a different order — which is exactly how
+    TestStandaloneSendLogging passed locally at 686 and failed on CI.
+    """
+    for var in (
+        "BAND_AGENT_ID",
+        "BAND_API_KEY",
+        "BAND_OWNER_ID",
+        "BAND_BASE_URL",
+        "BAND_HUB_ROOM",
+        "BAND_HOME_ROOM",
+    ):
+        monkeypatch.delenv(var, raising=False)

@@ -4490,6 +4490,9 @@ class TestStandaloneSendLogging:
     async def test_delivery_reports_the_message_id(self, monkeypatch, caplog):
         monkeypatch.setenv("BAND_AGENT_ID", "agent-self")
         monkeypatch.setenv("BAND_API_KEY", "secret-key")
+        # Out-of-turn delivery addresses the owner, so this is required for the
+        # send to reach the point where it reports a message id at all.
+        monkeypatch.setenv("BAND_OWNER_ID", "owner-uuid")
         rest = _rest_stub([
             _participant("owner-uuid", "Owner", "owner"),
             _participant("human-1", "Alice", "alice"),
