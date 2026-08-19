@@ -51,6 +51,7 @@ from .adapter import (
     sender_of,
     _derive_urls,
     _mention_items,
+    align_mentions_to_content,
     _short_id,
     check_band_requirements,
 )
@@ -572,6 +573,7 @@ async def _handle_create_room(args: dict, **kwargs) -> str:
                     id=resolved["id"], handle=resolved.get("handle"), name=resolved.get("name")
                 )
             ]
+            mentions = align_mentions_to_content(message, mentions)
             chunks = BasePlatformAdapter.truncate_message(message, _MAX_MESSAGE_LENGTH)
             sent_id: Optional[str] = None
             for chunk in chunks:
@@ -715,6 +717,7 @@ async def _handle_send_message(args: dict, **kwargs) -> str:
             if owner:
                 mention_ids = [owner]
         mentions = await _mentions_for(rest, room_id, mention_ids)
+        mentions = align_mentions_to_content(content, mentions)
 
         chunks = BasePlatformAdapter.truncate_message(content, _MAX_MESSAGE_LENGTH)
         last_id: Optional[str] = None

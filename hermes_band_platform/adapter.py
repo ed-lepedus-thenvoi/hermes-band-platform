@@ -40,6 +40,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -367,6 +368,70 @@ def end_turn(room_id: Optional[str]) -> None:
         _deliberate_sends.pop(room_id, None)
 
 
+def _substitutes_safely(content: str, token: str) -> bool:
+    """Return whether the platform can safely substitute this display field.
+
+    A field is safe when each occurrence is a complete mention token (or when
+    the field does not occur at all). If a handle appears inside a longer token,
+    the caller withholds it so the structured mention can be placed without
+    changing the author's text. Matching remains case-sensitive to match the
+    externally observed rendering behavior.
+    """
+    if not token:
+        return False
+    literal = "@" + token
+    occurrences = (content or "").count(literal)
+    if occurrences == 0:
+        return True
+    # Not preceded by a word character, "@" or "/" (so a handle inside a URL
+    # path or a longer qualified handle does not count), and not followed by a
+    # word character, "/" or "@". A trailing "." or "-" is only a continuation
+    # when a word character follows it — handles contain dots ("ed.lepedus"),
+    # but "@alice." at the end of a sentence is still a whole token.
+    pattern = rf"(?<![\w@/])@{re.escape(token)}(?![\w/@]|[.-]\w)"
+    return len(re.findall(pattern, content or "")) == occurrences
+
+
+def align_mentions_to_content(content: str, mention_items: List[Any]) -> List[Any]:
+    """Withhold mention fields the server would substitute into the wrong word.
+
+    Returns mention items with ``handle`` and/or ``name`` cleared where leaving
+    them would corrupt the content. Clearing a field costs only placement — the
+    server falls through to prepending ``@[[uuid]]``, which renders correctly —
+    whereas leaving it can produce text no client can render back.
+
+    The content itself is never modified. Where the handle *is* a whole token
+    the server's in-place substitution is the outcome we want: the mention
+    renders once, where its author put it.
+    """
+    if not mention_items:
+        return []
+    aligned: List[Any] = []
+    changed = False
+    for item in mention_items:
+        handle = getattr(item, "handle", None)
+        name = getattr(item, "name", None)
+        safe_handle = handle if _substitutes_safely(content, str(handle or "")) else None
+        safe_name = name if _substitutes_safely(content, str(name or "")) else None
+        if safe_handle == handle and safe_name == name:
+            aligned.append(item)
+            continue
+        changed = True
+        logger.debug(
+            "[band] Withholding unsafe mention field(s) for %s (handle=%s name=%s)",
+            _short_id(getattr(item, "id", None)),
+            safe_handle is not None,
+            safe_name is not None,
+        )
+        aligned.append(
+            type(item)(id=getattr(item, "id", None), handle=safe_handle, name=safe_name)
+        )
+    # Hand back the caller's own list when nothing needed withholding, so the
+    # common path allocates nothing and callers can still compare identity.
+    return aligned if changed else mention_items
+
+
+
 def _mention_items(
     participants: List[Dict[str, Any]],
     *,
@@ -488,6 +553,7 @@ async def _post_chunks(
     last_resp: Any = None
     continuation: List[str] = []
     posted = 0
+    mention_items = align_mentions_to_content(content, mention_items)
     for chunk in BasePlatformAdapter.truncate_message(content, max_length):
         resp = await rest.agent_api_messages.create_agent_chat_message(
             chat_id=room_id,
