@@ -358,6 +358,60 @@ class TestSendMessage:
         assert mentions[0].handle == "y"
 
     @pytest.mark.asyncio
+    async def test_self_in_mention_ids_sends_as_a_reference(self, owner_session):
+        """A model that names its own id must not lose the whole message.
+
+        Band answers a self @mention with 422 cannot_mention_self and drops the
+        entire message, so the self entry is demoted to a reference and the real
+        recipient still receives it.
+        """
+        rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[
+                    _peer("agent-self", handle="bot", ptype="Agent"),
+                    _peer("u-y", handle="y"),
+                ]
+            )
+        )
+        with _patch_rest(rest), _patch_agent_id("agent-self"):
+            out = _parse(
+                await band_tools._handle_send_message(
+                    {"content": "hi", "mention_ids": ["u-y", "agent-self"]}
+                )
+            )
+        assert out["success"] is True
+        call = rest.agent_api_messages.create_agent_chat_message.await_args
+        mentions = call.kwargs["message"].mentions
+        assert [m.id for m in mentions] == ["u-y", "agent-self"]
+        assert getattr(mentions[0], "kind", None) is None   # normal recipient
+        assert mentions[1].kind == "reference"               # us, demoted
+
+    @pytest.mark.asyncio
+    async def test_only_self_in_mention_ids_errors_before_sending(
+        self, owner_session
+    ):
+        """Self alone leaves nobody to deliver to — say so, don't 422."""
+        rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[
+                    _peer("agent-self", handle="bot", ptype="Agent"),
+                    _peer("u-y", handle="y"),
+                ]
+            )
+        )
+        with _patch_rest(rest), _patch_agent_id("agent-self"):
+            out = _parse(
+                await band_tools._handle_send_message(
+                    {"content": "hi", "mention_ids": ["agent-self"]}
+                )
+            )
+        assert "error" in out
+        assert "cannot @mention itself" in out["error"]
+        rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_no_mentionable_recipient_errors(self, owner_session):
         rest = _make_rest()
         # Only the agent in the room -> nothing to mention after self-exclusion.
@@ -760,6 +814,53 @@ class TestMentionItems:
         assert self._ids(items) == ["u1", "u2"]
         assert items[0].handle == "alice"   # resolved
         assert items[1].handle is None      # unknown id → bare mention
+
+    def test_explicit_ids_carry_no_kind_so_the_server_defaults_them(self):
+        """Only a self entry is ever sent with an explicit ``kind``.
+
+        Every other recipient omits the field, leaving the server's ``"mention"``
+        default to apply — so the wire payload for a normal send is unchanged.
+        """
+        from hermes_band_platform.adapter import _mention_items
+
+        items = _mention_items(
+            [{"id": "u1", "handle": "alice"}], agent_id="me", explicit_ids=["u1"]
+        )
+        assert getattr(items[0], "kind", None) is None
+
+    def test_explicit_self_id_is_demoted_to_a_reference(self):
+        """Band 422s a self @mention and rejects the *whole* message with it.
+
+        The self entry survives as a narrative reference (so an ``@self`` already
+        in the content still renders) while the real recipient stays a delivery
+        mention, which is what makes the message send at all.
+        """
+        from hermes_band_platform.adapter import (
+            _is_delivery_mention_item,
+            _mention_items,
+        )
+
+        parts = [
+            {"id": "me", "handle": "bot", "type": "Agent"},
+            {"id": "u1", "handle": "alice", "type": "User"},
+        ]
+        items = _mention_items(parts, agent_id="me", explicit_ids=["u1", "me"])
+        assert self._ids(items) == ["u1", "me"]          # order preserved
+        assert items[1].kind == "reference"
+        assert items[1].handle == "bot"                  # still resolved
+        assert _is_delivery_mention_item(items[0]) is True
+        assert _is_delivery_mention_item(items[1]) is False
+
+    def test_self_only_explicit_list_has_no_delivery_recipient(self):
+        """The demotion does not conjure a recipient — the caller must error."""
+        from hermes_band_platform.adapter import (
+            _is_delivery_mention_item,
+            _mention_items,
+        )
+
+        items = _mention_items([], agent_id="me", explicit_ids=["me"])
+        assert self._ids(items) == ["me"]
+        assert not any(_is_delivery_mention_item(i) for i in items)
 
     def test_preferred_wins_over_fallback(self):
         from hermes_band_platform.adapter import _mention_items

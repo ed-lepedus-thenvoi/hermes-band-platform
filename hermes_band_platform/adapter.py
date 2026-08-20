@@ -423,13 +423,41 @@ def align_mentions_to_content(content: str, mention_items: List[Any]) -> List[An
             safe_handle is not None,
             safe_name is not None,
         )
-        aligned.append(
-            type(item)(id=getattr(item, "id", None), handle=safe_handle, name=safe_name)
-        )
+        # Rebuilding must carry the mention's kind across. Dropping it would
+        # let a demoted self mention (kind="reference") revert to the server's
+        # "mention" default, and Band answers a self delivery mention with 422
+        # cannot_mention_self — rejecting the whole message. That would only bite
+        # when a field is actually withheld, which is the worst kind of bug to
+        # own: intermittent, and invisible in the common path.
+        rebuilt: Dict[str, Any] = {
+            "id": getattr(item, "id", None),
+            "handle": safe_handle,
+            "name": safe_name,
+        }
+        kind = getattr(item, "kind", None)
+        if kind is not None:
+            rebuilt["kind"] = kind
+        aligned.append(type(item)(**rebuilt))
     # Hand back the caller's own list when nothing needed withholding, so the
     # common path allocates nothing and callers can still compare identity.
     return aligned if changed else mention_items
 
+
+#: Band's non-delivery mention kind: the entry renders as a chip but pings
+#: nobody. The API defaults an omitted ``kind`` to ``"mention"``, so this is the
+#: only value we ever send explicitly.
+_MENTION_KIND_REFERENCE = "reference"
+
+
+def _is_delivery_mention_item(item: Any) -> bool:
+    """Whether an *outbound* mention item actually delivers to its recipient.
+
+    Mirrors the server's rule — an absent ``kind`` means ``"mention"`` — so a
+    list that has been through :func:`_mention_items` can be checked for a real
+    recipient before it is sent. Band rejects a message carrying no delivery
+    mention, so a caller that can produce a better error should test this first.
+    """
+    return getattr(item, "kind", None) != _MENTION_KIND_REFERENCE
 
 
 def _mention_items(
@@ -445,13 +473,28 @@ def _mention_items(
     and the ``band_send_message`` tool so both behave identically. Precedence:
 
       1. ``explicit_ids`` — one item per id (handle/name resolved from
-         *participants* when present).
+         *participants* when present). An id equal to *agent_id* is emitted as a
+         ``kind="reference"`` entry — see below.
       2. ``preferred`` — a single recipient (the reply auto-mention, e.g. the
          last human sender).
       3. otherwise — every non-agent participant in the room.
 
     Returns a possibly-empty list; the caller decides whether empty is an error
     (the tool raises; the adapter lets Band reject the send).
+
+    **Why a self id is demoted rather than dropped.** Band answers a message that
+    @mentions its own sender with ``422 cannot_mention_self`` and rejects the
+    *whole* message, so one bad id takes every real recipient down with it.
+    Platform-side, self-mention validation only rejects a self entry that is a
+    *delivery* mention — referencing yourself narratively is allowed — and the
+    content rewriter leaves a reference alone when the text carries no matching
+    ``@``-token. Demoting therefore preserves the caller's list, and the
+    rendering of an ``@self`` the content really does contain, where dropping
+    would silently rewrite the request.
+
+    ``kind`` is set **only** for that self entry: every other item omits the
+    field so the server applies its own ``"mention"`` default, keeping the wire
+    payload for normal recipients identical to before.
     """
     by_id = {p["id"]: p for p in participants if p.get("id")}
     ids = [str(m).strip() for m in (explicit_ids or []) if str(m).strip()]
@@ -461,6 +504,7 @@ def _mention_items(
                 id=mid,
                 handle=(by_id.get(mid) or {}).get("handle"),
                 name=(by_id.get(mid) or {}).get("name"),
+                **({"kind": _MENTION_KIND_REFERENCE} if mid == agent_id else {}),
             )
             for mid in ids
         ]

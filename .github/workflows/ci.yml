@@ -78,3 +78,6 @@ jobs:
 
       - name: Probe real usage contract (no pytest stubs)
         run: python scripts/probe_band_sdk_usage_contract.py
+
+      - name: Probe real mention-kind contract (no pytest stubs)
+        run: python scripts/probe_band_sdk_mention_kind_contract.py

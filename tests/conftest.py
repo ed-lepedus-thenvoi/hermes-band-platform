@@ -83,10 +83,23 @@ def _install_band_mock() -> MagicMock:
             self.mentions = mentions
 
     class _FakeChatMessageRequestMentionsItem:
-        def __init__(self, id, handle=None, name=None):
+        """Stand-in for the Fern ``ChatMessageRequestMentionsItem``.
+
+        ``kind`` rides in ``**extra`` because the real model accepts it that way:
+        the generated class declares only ``handle``/``id``/``name``, but its
+        pydantic config is ``extra="allow"``, so an unexpected ``kind`` kwarg is
+        kept and serialised onto the wire. Rejecting it here would make the stub
+        *stricter* than the SDK and hide the self-mention demotion from the
+        suite. That the SDK really does carry it — at the declared floor — is
+        pinned separately by ``scripts/probe_band_sdk_mention_kind_contract.py``.
+        """
+
+        def __init__(self, id, handle=None, name=None, **extra):
             self.id = id
             self.handle = handle
             self.name = name
+            for key, value in extra.items():
+                setattr(self, key, value)
 
     class _FakeParticipantRequest:
         def __init__(self, participant_id, role=None):

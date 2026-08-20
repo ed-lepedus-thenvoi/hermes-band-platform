@@ -90,6 +90,34 @@ class TestAlignment:
         assert aligned[0].handle is None
         assert aligned[0].id == "owner-uuid"
 
+    def test_withholding_a_field_keeps_the_mention_kind(self):
+        """A demoted self mention must not be re-promoted by the rebuild.
+
+        Alignment only rebuilds an item when it withholds a field, so a dropped
+        ``kind`` would revert the entry to the server's ``"mention"`` default
+        exactly and only on the corrupting-handle path — and Band answers a self
+        delivery mention with 422 cannot_mention_self for the whole message.
+        """
+        content = "@ageofascension/ted please take a look"
+        mentions = _mention_items(
+            [
+                {
+                    "id": "agent-self",
+                    "type": "Agent",
+                    "handle": "ageofascension",
+                    "name": "BandAId",
+                }
+            ],
+            agent_id="agent-self",
+            explicit_ids=["agent-self"],
+        )
+        assert mentions[0].kind == "reference"
+
+        aligned = align_mentions_to_content(content, mentions)
+
+        assert aligned[0].handle is None        # withheld -> the item was rebuilt
+        assert aligned[0].kind == "reference"   # and the kind survived it
+
     def test_a_matching_handle_is_left_alone_so_it_renders_in_place(self):
         """The case #51's strip broke: substitution here is the good outcome."""
         content = "@twins-owner/dumpty please reply with ACK"

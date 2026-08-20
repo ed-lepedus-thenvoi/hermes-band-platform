@@ -50,6 +50,7 @@ from .adapter import (
     note_deliberate_send,
     sender_of,
     _derive_urls,
+    _is_delivery_mention_item,
     _mention_items,
     align_mentions_to_content,
     _short_id,
@@ -444,7 +445,8 @@ async def _mentions_for(
 
     If ``mention_ids`` is given, build one mention per id (handle resolved from
     the room participants when cheap). Otherwise mention every non-agent
-    participant in the room. Raises ``_ToolError`` if the result is empty.
+    participant in the room. Raises ``_ToolError`` if the result carries no
+    recipient Band would actually deliver to.
     """
     if not _load_sdk():
         raise _ToolUnavailable("Band not available (band-sdk not installed)")
@@ -452,15 +454,27 @@ async def _mentions_for(
     # Fetch participants once for handle resolution / fallback mentions, then
     # delegate to the shared builder (same semantics as the adapter's send).
     participants = await _list_participants(rest, room_id)
-    # Resolve the running agent's id so the fallback never @mentions ourselves
-    # (irrelevant when explicit mention_ids are given).
-    agent_id = None if mention_ids else await _agent_id_or_none(rest)
+    # Resolve the running agent's id on BOTH paths. The fallback needs it to skip
+    # ourselves; an explicit list needs it because a model that names its own id
+    # would otherwise send a self @mention, which Band answers with 422
+    # cannot_mention_self — rejecting the whole message, valid recipients and all.
+    # _mention_items demotes that entry to a narrative reference instead.
+    agent_id = await _agent_id_or_none(rest)
     items = _mention_items(participants, agent_id=agent_id, explicit_ids=mention_ids)
 
     if not items:
         raise _ToolError(
             "Band requires at least one @mention; no mentionable recipient was found "
             "(pass mention_ids or add a participant to the room first)"
+        )
+    if not any(_is_delivery_mention_item(i) for i in items):
+        # Reachable when every id given was our own: each became a reference, and
+        # a message of references alone delivers to nobody, so Band rejects it.
+        # Say so plainly — the model can retry with a real recipient.
+        raise _ToolError(
+            "Band requires at least one @mention of someone else, and the only id "
+            "given was this agent's own — an agent cannot @mention itself. Name a "
+            "real recipient, or pass reply_to to address a message's author."
         )
     return items
 
