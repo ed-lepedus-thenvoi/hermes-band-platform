@@ -144,6 +144,33 @@ _ROOM_CACHE_MAX = 2000
 # so a server that pathologically re-offers an un-ackable message can't spin.
 _MAX_DRAIN_IDLESS_SKIPS = 50
 
+# How often to sample whether the link's websocket supervisor is still running.
+#
+# The websocket client stops supervising on a *clean* close (1000/1001) —
+# ``ReconnectPolicy.reconnect_on_normal_close`` defaults False, so the supervisor
+# loop breaks and nothing above it retries. Nothing raises: the consumer stays
+# parked on the link's event queue, ``BandLink.is_connected`` keeps returning
+# True, and outbound REST sends keep working, so the agent looks healthy from
+# every angle while receiving nothing. Observed four times in production, the
+# worst a 34-hour silence, each only noticed when a human asked why the agent
+# had stopped answering.
+#
+# Detection has to be sampled because there is no event to subscribe to: the
+# SDK's ``on_disconnect`` hook fires *before* the reconnect decision, so it
+# cannot distinguish "dropped, retrying" from "dropped, giving up", and only a
+# platform-initiated *supersede* queues a disconnect event.
+#
+# 30s trades a bounded deaf window against a poll that costs a few attribute
+# reads. Do NOT raise this into minutes: the window is time the agent is
+# silently unreachable, and the sample is far cheaper than the recovery.
+_LINK_HEALTH_POLL_SECONDS = 30.0
+
+# Names of the websocket-client states that mean "no longer supervising".
+# Compared by name rather than importing ``ClientState``, so the plugin keeps
+# its single dependency on the ``band`` package and this survives the enum
+# moving inside the transitive phoenix-channels client.
+_DEAD_CLIENT_STATE_NAMES = frozenset({"CLOSED", "SHUTTING_DOWN"})
+
 # Minimum gap between two ``working: true`` reports for the same room.
 #
 # The Band working indicator is LIVE STATE with a server-side TTL, not a latch:
@@ -921,6 +948,13 @@ class BandAdapter(BasePlatformAdapter):
         self._catch_up_task: Optional[asyncio.Task] = None
         # Per-room re-join drains, held so the tasks aren't GC'd mid-flight.
         self._room_catch_up_tasks: set = set()
+        # Samples whether the link's websocket supervisor is still running, so a
+        # clean close that disables reconnect becomes a retryable fatal error
+        # instead of a permanently deaf adapter. (Re)started on connect.
+        self._link_health_task: Optional[asyncio.Task] = None
+        # One-time guard for "the liveness probe cannot see the supervisor",
+        # which means this protection is off and the SDK internals moved.
+        self._warned_link_probe_blind: bool = False
         # One-time guard for the session-isolation misconfig warning.
         self._warned_session_isolation: bool = False
 
@@ -1079,6 +1113,7 @@ class BandAdapter(BasePlatformAdapter):
             # Background drain of each known room's offline backlog (Route A);
             # never delays connect() or blocks the live consumer.
             self._schedule_catch_up()
+            self._start_link_health_watch()
             return True
         except Exception as e:
             usage_events.untrack_adapter(self)
@@ -1205,6 +1240,94 @@ class BandAdapter(BasePlatformAdapter):
                 e,
             )
 
+    # ── Link liveness ─────────────────────────────────────────────────────
+
+    def _start_link_health_watch(self) -> None:
+        """Start the sampler that turns a dead websocket supervisor into a
+        retryable fatal error. Idempotent."""
+        if self._link_health_task is not None and not self._link_health_task.done():
+            return
+        self._link_health_task = asyncio.create_task(self._watch_link_health())
+
+    def _link_supervisor_stopped(self) -> Optional[bool]:
+        """Has the link's websocket supervisor stopped for good?
+
+        Tri-state on purpose: True (stopped), False (still supervising), or
+        None when the answer cannot be established. None must never be treated
+        as a failure — the whole point of this probe is to tear down a link
+        that is provably dead, and guessing would tear down healthy ones.
+
+        Reads the SDK's internals because there is no public accessor for it.
+        Every hop is optional, so an SDK that renames one of these degrades to
+        None (reported once by the caller) instead of raising.
+        """
+        link = self._link
+        if link is None:
+            return None
+        client = getattr(getattr(link, "_ws", None), "client", None)
+        if client is None:
+            return None
+
+        # The supervisor task is the direct answer: its loop only exits on
+        # shutdown or on a decision not to reconnect, so "done" is exactly the
+        # condition we care about.
+        task = getattr(client, "_supervisor_task", None)
+        if isinstance(task, asyncio.Task):
+            return task.done()
+
+        # Fallback for an SDK that stops exposing the task. Safe only because
+        # we sample strictly between a successful connect() and disconnect(),
+        # so a closed client cannot be a not-yet-started one.
+        state_name = getattr(getattr(client, "_state", None), "name", None)
+        if isinstance(state_name, str):
+            return state_name in _DEAD_CLIENT_STATE_NAMES
+        return None
+
+    async def _watch_link_health(self) -> None:
+        """Sample link liveness; escalate a dead supervisor to the runner.
+
+        Escalation reuses the retryable-fatal-error path the consumer-death
+        case already uses: the runner logs at ERROR, drops the adapter, and
+        queues the platform for background reconnection. This deliberately does
+        NOT reconnect by itself — the runner owns adapter lifecycle, and a
+        second reconnect loop here would race it.
+        """
+        try:
+            while True:
+                await asyncio.sleep(_LINK_HEALTH_POLL_SECONDS)
+                # A teardown already in progress owns the link; nothing to do.
+                if not self._running or self._link is None:
+                    return
+
+                stopped = self._link_supervisor_stopped()
+                if stopped is None:
+                    if not self._warned_link_probe_blind:
+                        self._warned_link_probe_blind = True
+                        logger.warning(
+                            "[band] Cannot determine websocket supervisor state; "
+                            "a link that stops reconnecting will not be detected. "
+                            "The band-sdk internals this probe reads have moved."
+                        )
+                    continue
+                if not stopped:
+                    continue
+
+                msg = (
+                    "Band websocket supervisor stopped and will not reconnect "
+                    "(a clean close disables reconnect); the adapter can no "
+                    "longer receive messages"
+                )
+                logger.error("[band] %s", msg)
+                self._set_fatal_error("link_died", msg, retryable=True)
+                await self._notify_fatal_error()
+                return
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            # Never let the watchdog's own failure be silent: without it the
+            # adapter is back to going deaf without a trace.
+            logger.error("[band] Link health watchdog stopped unexpectedly: %s", e)
+
     async def disconnect(self) -> None:
         """Cancel the consumer, drop the link, release the scoped lock."""
         # Close the submission gate before taking down the link. Cancellation is
@@ -1246,6 +1369,22 @@ class BandAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("[band] Consumer task raised on shutdown: %s", e)
         self._consumer_task = None
+
+        # The watchdog escalates by calling the runner's fatal handler, and that
+        # handler disconnects us — so this can be reached *from* the watchdog
+        # task. Awaiting it then would be awaiting the current task. Cancel
+        # without awaiting in that case; the task is already unwinding.
+        health_task = self._link_health_task
+        if health_task and not health_task.done():
+            health_task.cancel()
+            if health_task is not asyncio.current_task():
+                try:
+                    await health_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.debug("[band] Link health task raised on shutdown: %s", e)
+        self._link_health_task = None
 
         if self._link is not None:
             try:

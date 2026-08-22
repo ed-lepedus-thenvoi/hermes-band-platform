@@ -4912,3 +4912,363 @@ class TestEmptyFinalTextIsNotPosted:
 
         assert result.success is True
         link.rest.agent_api_events.create_agent_chat_event.assert_not_awaited()
+
+
+class TestLinkLivenessProbe:
+    """``_link_supervisor_stopped`` reads band-sdk internals, so its contract is
+    tri-state: stopped, still running, or *unknown*.
+
+    Unknown is the load-bearing case. The probe reaches through
+    ``link._ws.client`` into attributes the plugin does not own, and the cost of
+    misreading a moved attribute as "dead" is tearing down healthy links on a
+    timer. Every test here that returns None is asserting that we decline to
+    guess.
+    """
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        return _make_adapter(monkeypatch)
+
+    @staticmethod
+    def _link(client):
+        """A link whose ``_ws.client`` is ``client`` (None ⇒ no ws at all)."""
+        link = MagicMock()
+        link._ws = None if client is None else SimpleNamespace(client=client)
+        return link
+
+    def test_no_link_is_unknown(self, adapter):
+        adapter._link = None
+        assert adapter._link_supervisor_stopped() is None
+
+    def test_no_websocket_is_unknown(self, adapter):
+        adapter._link = self._link(None)
+        assert adapter._link_supervisor_stopped() is None
+
+    @pytest.mark.asyncio
+    async def test_a_running_supervisor_task_is_not_stopped(self, adapter):
+        task = asyncio.create_task(asyncio.sleep(999))
+        try:
+            adapter._link = self._link(SimpleNamespace(_supervisor_task=task))
+            assert adapter._link_supervisor_stopped() is False
+        finally:
+            task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_finished_supervisor_task_is_stopped(self, adapter):
+        # This is the #43 shape: the supervisor loop broke on a clean close and
+        # returned, so the task completes while everything else looks healthy.
+        task = asyncio.create_task(asyncio.sleep(0))
+        await task
+        adapter._link = self._link(SimpleNamespace(_supervisor_task=task))
+        assert adapter._link_supervisor_stopped() is True
+
+    def test_state_name_is_the_fallback_when_the_task_is_gone(self, adapter):
+        # An SDK that stops exposing _supervisor_task must not silently disable
+        # the protection while _state is still readable.
+        adapter._link = self._link(SimpleNamespace(_state=SimpleNamespace(name="CLOSED")))
+        assert adapter._link_supervisor_stopped() is True
+
+        adapter._link = self._link(
+            SimpleNamespace(_state=SimpleNamespace(name="CONNECTED"))
+        )
+        assert adapter._link_supervisor_stopped() is False
+
+    def test_neither_accessor_is_unknown_not_dead(self, adapter):
+        # The whole SDK surface moved. Refuse to answer rather than tear down a
+        # link that may well be healthy.
+        adapter._link = self._link(SimpleNamespace())
+        assert adapter._link_supervisor_stopped() is None
+
+    def test_a_non_task_supervisor_attr_falls_through_to_state(self, adapter):
+        # Guards the isinstance check: a MagicMock's .done() is truthy, so
+        # duck-typing here would report every link as stopped.
+        adapter._link = self._link(
+            SimpleNamespace(_supervisor_task=MagicMock(), _state=SimpleNamespace(name="CONNECTED"))
+        )
+        assert adapter._link_supervisor_stopped() is False
+
+
+class TestLinkDeathEscalation:
+    """A link that stops reconnecting must become a retryable fatal error.
+
+    Before this existed, a clean websocket close (1000/1001) disabled reconnect
+    four layers down and *nothing* noticed: the consumer stayed parked on the
+    link's event queue rather than raising, ``BandLink.is_connected`` kept
+    returning True, and outbound REST sends kept succeeding. The adapter was
+    deaf and every available signal said it was fine — four production
+    occurrences, the worst 34 hours.
+
+    Escalation is deliberately delegated to the runner's fatal-error path
+    (the same one consumer death uses) rather than reconnecting here, so these
+    tests assert the handoff, not a reconnect.
+    """
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        a = _make_adapter(monkeypatch)
+        # The sampler's cadence is irrelevant to its logic; drive it fast.
+        monkeypatch.setattr(_band_mod, "_LINK_HEALTH_POLL_SECONDS", 0.001)
+        a._running = True
+        a._link = MagicMock()
+        return a
+
+    @staticmethod
+    async def _run_watch(adapter, timeout=1.0):
+        """Run the sampler to completion, which it only reaches by escalating."""
+        await asyncio.wait_for(adapter._watch_link_health(), timeout=timeout)
+
+    @staticmethod
+    async def _poll_a_while(adapter, seconds=0.05):
+        """Let the sampler take many polls, then stop it.
+
+        Deliberately not ``wait_for(..., timeout=)``: the sampler absorbs
+        cancellation by design, so a timeout there is indistinguishable from a
+        clean exit and the assertion would pass for the wrong reason. Run it as
+        its own task and inspect what it did.
+        """
+        task = asyncio.create_task(adapter._watch_link_health())
+        await asyncio.sleep(seconds)
+        exited_on_its_own = task.done()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return exited_on_its_own
+
+    @pytest.mark.asyncio
+    async def test_a_dead_link_is_reported_to_the_runner(self, adapter):
+        notified = []
+        adapter._link_supervisor_stopped = lambda: True
+        adapter._notify_fatal_error = AsyncMock(
+            side_effect=lambda: notified.append(adapter.fatal_error_code)
+        )
+
+        await self._run_watch(adapter)
+
+        # Retryable, so the runner queues a reconnect instead of giving up.
+        assert adapter.fatal_error_code == "link_died"
+        assert adapter.fatal_error_retryable is True
+        assert adapter.has_fatal_error
+        # The error must be *set* before the handler runs — the handler reads it.
+        assert notified == ["link_died"]
+
+    @pytest.mark.asyncio
+    async def test_a_dead_link_logs_at_error(self, adapter, caplog):
+        # #43's other half: the give-up decision is logged at INFO by the
+        # websocket client, so no amount of WARNING-level alerting could ever
+        # catch this. The escalation has to be the thing that raises the level.
+        adapter._link_supervisor_stopped = lambda: True
+        adapter._notify_fatal_error = AsyncMock()
+
+        with caplog.at_level(logging.ERROR, logger=_ADAPTER_LOGGER):
+            await self._run_watch(adapter)
+
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_probe_never_escalates(self, adapter):
+        # The safety property: an SDK whose internals moved degrades to "no
+        # protection", never to "tear the link down on a timer".
+        adapter._link_supervisor_stopped = lambda: None
+        adapter._notify_fatal_error = AsyncMock()
+
+        assert await self._poll_a_while(adapter) is False
+        assert not adapter.has_fatal_error
+        adapter._notify_fatal_error.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_probe_warns_once(self, adapter, caplog):
+        adapter._link_supervisor_stopped = lambda: None
+
+        with caplog.at_level(logging.WARNING, logger=_ADAPTER_LOGGER):
+            await self._poll_a_while(adapter)
+
+        blind = [r for r in caplog.records if "Cannot determine" in r.getMessage()]
+        assert len(blind) == 1, "the probe polls on a timer; it must not spam"
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_link_is_left_alone(self, adapter):
+        adapter._link_supervisor_stopped = lambda: False
+        adapter._notify_fatal_error = AsyncMock()
+
+        assert await self._poll_a_while(adapter) is False
+        assert not adapter.has_fatal_error
+        adapter._notify_fatal_error.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_teardown_in_progress_is_not_a_dead_link(self, adapter):
+        # disconnect() drops the link and clears _running. Sampling that as
+        # "died" would report a fatal error for every ordinary shutdown.
+        adapter._running = False
+        adapter._link_supervisor_stopped = lambda: True
+        adapter._notify_fatal_error = AsyncMock()
+
+        await self._run_watch(adapter)
+
+        assert not adapter.has_fatal_error
+        adapter._notify_fatal_error.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_dropped_link_is_not_a_dead_link(self, adapter):
+        adapter._link = None
+        adapter._link_supervisor_stopped = lambda: True
+        adapter._notify_fatal_error = AsyncMock()
+
+        await self._run_watch(adapter)
+
+        assert not adapter.has_fatal_error
+        adapter._notify_fatal_error.assert_not_called()
+
+
+class TestLinkHealthWatchLifecycle:
+    """The sampler is wired into connect/disconnect, not merely defined.
+
+    ``test_connect_arms_the_watch_end_to_end`` is the regression that matters:
+    it goes through the real ``connect()`` and asserts a dead supervisor
+    escalates, so it fails on any build where the sampler exists but nothing
+    starts it. The narrower tests below say *why* it broke.
+    """
+
+    @staticmethod
+    def _patch_locks(monkeypatch):
+        monkeypatch.setattr(
+            "gateway.status.acquire_scoped_lock",
+            lambda scope, identity, metadata=None: (True, None),
+        )
+        monkeypatch.setattr(
+            "gateway.status.release_scoped_lock",
+            lambda scope, identity: None,
+        )
+
+    @classmethod
+    def _fake_link(cls, client=None):
+        """A connectable link whose ``_ws.client`` is the given fake client."""
+        link = MagicMock()
+        link.connect = AsyncMock()
+        link.disconnect = AsyncMock()
+        link.subscribe_agent_rooms = AsyncMock()
+        link.subscribe_room = AsyncMock()
+        link._ws = SimpleNamespace(client=client)
+        link.rest.agent_api_identity.get_agent_me = AsyncMock(
+            return_value=SimpleNamespace(
+                data=SimpleNamespace(
+                    id="resolved-agent-id",
+                    handle="bot-handle",
+                    owner_uuid="owner-uuid-abc",
+                )
+            )
+        )
+        link.rest.agent_api_chats.list_agent_chats = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[], metadata=SimpleNamespace(total_pages=1)
+            )
+        )
+        link.__aiter__ = lambda self: self
+        link.__anext__ = AsyncMock(side_effect=StopAsyncIteration)
+        return link
+
+    @pytest.mark.asyncio
+    async def test_connect_arms_the_watch_end_to_end(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        self._patch_locks(monkeypatch)
+        # raising=False so this test's only failure mode is the behavioural one
+        # below. Requiring the constant would make a build that never samples
+        # fail with AttributeError on a test *knob*, which says nothing about
+        # whether a dead link gets noticed.
+        monkeypatch.setattr(
+            _band_mod, "_LINK_HEALTH_POLL_SECONDS", 0.001, raising=False
+        )
+
+        # A supervisor task that has already finished — the #43 condition,
+        # present from the moment we connect.
+        finished = asyncio.create_task(asyncio.sleep(0))
+        await finished
+        link = self._fake_link(SimpleNamespace(_supervisor_task=finished))
+        monkeypatch.setattr(_band_mod, "BandLink", lambda *a, **kw: link)
+
+        escalated = asyncio.Event()
+        monkeypatch.setattr(
+            adapter, "_notify_fatal_error", AsyncMock(side_effect=escalated.set)
+        )
+
+        assert await adapter.connect() is True
+        try:
+            await asyncio.wait_for(escalated.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pytest.fail(
+                "connect() left the link unsupervised: a websocket that had "
+                "already stopped reconnecting was never escalated"
+            )
+        assert adapter.fatal_error_code == "link_died"
+
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_starts_the_watch_task(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        self._patch_locks(monkeypatch)
+        link = self._fake_link(SimpleNamespace(_supervisor_task=None))
+        monkeypatch.setattr(_band_mod, "BandLink", lambda *a, **kw: link)
+
+        assert await adapter.connect() is True
+        assert adapter._link_health_task is not None
+        assert not adapter._link_health_task.done()
+
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_the_watch_task(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        task = asyncio.create_task(asyncio.sleep(999))
+        adapter._link_health_task = task
+        adapter._link = MagicMock()
+        adapter._link.disconnect = AsyncMock()
+
+        await adapter.disconnect()
+
+        assert task.cancelled() or task.done()
+        assert adapter._link_health_task is None
+
+    @pytest.mark.asyncio
+    async def test_starting_the_watch_twice_keeps_one_task(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        monkeypatch.setattr(adapter, "_link_supervisor_stopped", lambda: False)
+        adapter._start_link_health_watch()
+        first = adapter._link_health_task
+        adapter._start_link_health_watch()
+        try:
+            assert adapter._link_health_task is first
+        finally:
+            first.cancel()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_from_inside_the_watch_does_not_deadlock(
+        self, monkeypatch
+    ):
+        # The escalation path is watchdog -> runner's fatal handler ->
+        # adapter.disconnect(), so disconnect() can be reached *from* the task
+        # it cancels. Awaiting the current task there would hang forever (or
+        # raise), turning the recovery into a wedge.
+        adapter = _make_adapter(monkeypatch)
+        monkeypatch.setattr(_band_mod, "_LINK_HEALTH_POLL_SECONDS", 0.001)
+        self._patch_locks(monkeypatch)
+        adapter._running = True
+        link = MagicMock()
+        link.disconnect = AsyncMock()
+        adapter._link = link
+        monkeypatch.setattr(adapter, "_link_supervisor_stopped", lambda: True)
+        monkeypatch.setattr(
+            adapter, "_notify_fatal_error", AsyncMock(side_effect=adapter.disconnect)
+        )
+
+        adapter._start_link_health_watch()
+        watch = adapter._link_health_task
+        done, _ = await asyncio.wait([watch], timeout=2.0)
+
+        assert watch in done, (
+            "disconnect() called from inside the watchdog never returned — the "
+            "recovery path wedged on awaiting its own task"
+        )
+        # Held separately: disconnect() clears adapter._link on its way out.
+        link.disconnect.assert_awaited_once()
